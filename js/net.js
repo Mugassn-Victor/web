@@ -1,8 +1,7 @@
 /* 联机封装。三层传输，逐级兜底：
    1) WebRTC P2P 直连（PeerJS 主信令 或 MQTT 备用信令交换 SDP）
    2) P2P 打不通（打洞失败/无 TURN）→ 对局消息走 MQTT broker 中继（延迟略高，仍可玩）
-   3) 手动直连（复制粘贴码，纯 P2P）
-   中继期间有心跳，对方真正断开 12 秒内检测到。 */
+   3) 中继期间有心跳，对方真正断开 12 秒内检测到；P2P 迟到打通自动升级回直连 */
 'use strict';
 
 const Net = (function () {
@@ -278,7 +277,7 @@ const Net = (function () {
     const sid = Math.random().toString(36).slice(2, 10);
     const st = {
       mq: null, topic: topic, sid: sid, timers: [],
-      offer: null, answer: null, answering: false, accepted: false, done: false, age: 0
+      offer: null, answer: null, answering: false, accepted: false, done: false
     };
     mqttSig = st;
 
@@ -347,11 +346,7 @@ const Net = (function () {
     };
     mq.connect();
 
-    // 45 秒兜底停表，避免一直占用 broker
-    st.timers.push(setInterval(function () {
-      st.age++;
-      if (st.age >= 18) stopSigPublishing();
-    }, 2500));
+    // 房间可长时间等待，offer/answer 的周期发布一直持续到连上或销毁
   }
 
   /* ===== WebRTC：手动直连与 MQTT 备用信令共用 ===== */
@@ -476,9 +471,6 @@ const Net = (function () {
     send: send,
     destroy: destroy,
     isConnected: isConnected,
-    signalingPending: signalingPending,
-    manualOffer: manualOffer,
-    manualAccept: manualAccept,
-    manualAnswer: manualAnswer
+    signalingPending: signalingPending
   };
 })();

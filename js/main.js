@@ -12,8 +12,6 @@
     mySide: null,
     roomId: null,
     mode: null,         // 'host' | 'guest'
-    connMode: null,     // 'auto' | 'manual'
-    autoTimer: null,
     phase: 'lobby',     // lobby | playing | over
     sel: null,
     targets: [],
@@ -28,9 +26,8 @@
   function sideName(s) { return s === RED ? '红方' : '黑方'; }
 
   function randCode() {
-    const cs = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let out = '';
-    for (let i = 0; i < 6; i++) out += cs[Math.floor(Math.random() * cs.length)];
+    for (let i = 0; i < 6; i++) out += Math.floor(Math.random() * 10);
     return out;
   }
 
@@ -219,6 +216,7 @@
     if (stt.over) { gameOver(stt); return; }
     if (stt.check) {
       UI.sound.check();
+      UI.fxCheck();
       toast('将军！');
     }
   }
@@ -431,7 +429,7 @@
   /* ================= 大厅 / 连接 ================= */
 
   function startGame(side, relay) {
-    clearTimeout(App.autoTimer);
+    stopWait();
     App.mySide = side;
     App.history = [];
     App.phase = 'playing';
@@ -444,7 +442,7 @@
 
     $('lobby').classList.add('hidden');
     $('game').classList.remove('hidden');
-    $('roomTag').textContent = App.connMode === 'manual' ? '手动直连' : '房间 ' + App.roomId;
+    $('roomTag').textContent = '房间 ' + App.roomId;
     $('sideTag').textContent = sideName(side) + (side === RED ? '（先手）' : '（后手）');
     const ct = $('connTag');
     ct.textContent = relay ? '中继连接' : '已连接';
@@ -455,40 +453,36 @@
     render();
   }
 
-  // 备用信令也连不上时给出超时提示，并引导到手动直连
-  function startAutoTimer() {
-    clearTimeout(App.autoTimer);
-    App.autoTimer = setTimeout(function () {
-      if (App.phase !== 'lobby' || Net.isConnected()) return;
-      lobbyStatus('连接超时：备用信令也没连上，请用下方“手动直连”复制码连接', true);
-      backToButtons();
-      showManual();
-    }, 16000);
+  /* --- 加入房间倒计时 --- */
+  const JOIN_TIMEOUT = 45;   // 秒：覆盖最坏情况（多个 broker 逐个超时 + P2P 等待 10s）
+  let waitTimer = null;
+  let waitLeft = 0;
+
+  function stopWait() {
+    if (waitTimer) { clearInterval(waitTimer); waitTimer = null; }
   }
 
-  function showManual() {
-    const actions = document.querySelector('.lobby-actions');
-    if (actions) actions.classList.add('hidden');
-    $('hostPanel').classList.add('hidden');
-    $('manualEntry').classList.add('hidden');
-    $('manualPanel').classList.remove('hidden');
-  }
-
-  function backToAuto() {
-    clearTimeout(App.autoTimer);
-    Net.destroy();
-    App.mode = null;
-    $('manualPanel').classList.add('hidden');
-    const actions = document.querySelector('.lobby-actions');
-    if (actions) actions.classList.remove('hidden');
-    $('manualEntry').classList.remove('hidden');
-    lobbyStatus('');
-    backToButtons();
+  function startJoinCountdown(roomId) {
+    stopWait();
+    waitLeft = JOIN_TIMEOUT;
+    lobbyStatus('正在连接房间 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
+    waitTimer = setInterval(function () {
+      if (App.phase !== 'lobby') { stopWait(); return; }
+      waitLeft--;
+      if (waitLeft <= 0) {
+        stopWait();
+        if (Net.isConnected()) return;
+        Net.destroy();
+        lobbyStatus('连接超时：对方可能不在房间或网络不畅，可重试', true);
+        backToButtons();
+        return;
+      }
+      lobbyStatus('正在连接房间 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
+    }, 1000);
   }
 
   function createRoom() {
     App.mode = 'host';
-    App.connMode = 'auto';
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
     App.roomId = randCode();
@@ -496,28 +490,26 @@
     // 房间号本地生成，不依赖信令服务器回传，立即显示
     $('roomCode').textContent = App.roomId;
     $('hostPanel').classList.remove('hidden');
-    lobbyStatus('正在创建房间…');
+    lobbyStatus('');
     Net.create(App.roomId);
-    startAutoTimer();
   }
 
   function joinRoom() {
-    const val = $('roomInput').value.trim().toUpperCase();
-    if (!/^[A-Z0-9]{4,8}$/.test(val)) {
-      lobbyStatus('请输入有效的房间号', true);
+    const val = $('roomInput').value.trim();
+    if (!/^\d{6}$/.test(val)) {
+      lobbyStatus('请输入 6 位数字房间号', true);
       return;
     }
     App.mode = 'guest';
-    App.connMode = 'auto';
     App.roomId = val;
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
-    lobbyStatus('正在连接房间 ' + val + '…');
     Net.join(val);
-    startAutoTimer();
+    startJoinCountdown(val);
   }
 
   function backToButtons() {
+    stopWait();
     $('btnCreate').disabled = false;
     $('btnJoin').disabled = false;
     $('hostPanel').classList.add('hidden');
@@ -534,7 +526,7 @@
     $('btnCreate').onclick = createRoom;
     $('btnJoin').onclick = joinRoom;
     $('roomInput').addEventListener('input', function (e) {
-      e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
     });
     $('roomInput').addEventListener('keydown', function (e) {
       if (e.key === 'Enter') joinRoom();
@@ -542,89 +534,6 @@
 
     $('btnCopy').onclick = function () {
       copyText(App.roomId || '', '房间号已复制');
-    };
-
-    /* --- 手动直连 --- */
-    $('btnShowManual').onclick = function () {
-      clearTimeout(App.autoTimer);
-      Net.destroy();
-      App.mode = null;
-      showManual();
-    };
-    $('btnBackAuto').onclick = backToAuto;
-
-    function manualStatus(which, msg, isErr) {
-      const el = $(which === 'host' ? 'manualStatusHost' : 'manualStatusGuest');
-      el.textContent = msg || '';
-      el.classList.toggle('error', !!isErr);
-    }
-
-    $('btnManualHost').onclick = function () {
-      $('manualRoles').classList.add('hidden');
-      $('manualGuest').classList.add('hidden');
-      $('manualHost').classList.remove('hidden');
-      App.connMode = 'manual';
-      App.mode = 'host';
-      manualStatus('host', '正在生成连接码…');
-      Net.manualOffer().then(function (code) {
-        $('offerOut').value = code;
-        manualStatus('host', '已生成，发给对方后等待应答码');
-      }).catch(function (e) {
-        manualStatus('host', '生成失败：' + (e && e.message ? e.message : e), true);
-      });
-    };
-
-    $('btnCopyOffer').onclick = function () {
-      const v = $('offerOut').value;
-      if (!v) { toast('请先生成连接码'); return; }
-      copyText(v, '连接码已复制');
-    };
-
-    $('btnAcceptAnswer').onclick = function () {
-      const v = $('answerIn').value.trim();
-      if (!v) { toast('请粘贴对方发回的应答码'); return; }
-      manualStatus('host', '正在建立点对点连接…');
-      Net.manualAccept(v).then(function () {
-        setTimeout(function () {
-          if (App.phase === 'lobby' && !Net.isConnected()) {
-            manualStatus('host', '连接失败：双方网络难以直连，可返回重新生成连接码再试', true);
-          }
-        }, 20000);
-      }).catch(function (e) {
-        manualStatus('host', '连接失败：' + (e && e.message ? e.message : e), true);
-      });
-    };
-
-    $('btnManualGuest').onclick = function () {
-      $('manualRoles').classList.add('hidden');
-      $('manualHost').classList.add('hidden');
-      $('manualGuest').classList.remove('hidden');
-      App.connMode = 'manual';
-      App.mode = 'guest';
-      $('offerIn').focus();
-    };
-
-    $('btnGenAnswer').onclick = function () {
-      const v = $('offerIn').value.trim();
-      if (!v) { toast('请先粘贴对方的连接码'); return; }
-      manualStatus('guest', '正在生成应答码…');
-      Net.manualAnswer(v).then(function (code) {
-        $('answerOut').value = code;
-        manualStatus('guest', '已生成，复制回给对方，等待连接…');
-        setTimeout(function () {
-          if (App.phase === 'lobby' && !Net.isConnected()) {
-            manualStatus('guest', '对方还没连上：确认已把应答码发给对方并由对方点“连接”', true);
-          }
-        }, 20000);
-      }).catch(function (e) {
-        manualStatus('guest', '生成失败：' + (e && e.message ? e.message : e), true);
-      });
-    };
-
-    $('btnCopyAnswer').onclick = function () {
-      const v = $('answerOut').value;
-      if (!v) { toast('请先生成应答码'); return; }
-      copyText(v, '应答码已复制');
     };
 
     $('btnUndo').onclick = requestUndo;
@@ -722,13 +631,9 @@
     });
 
     Net.on('conn-error', function (e) {
-      if (App.connMode === 'manual') {
-        // 手动面板有自己的 20 秒提示，这里不重复报错
-        return;
-      }
       if (App.phase === 'lobby') {
         lobbyStatus('点对点连接失败：' + (e && e.message ? e.message : 'NAT 打洞不通') +
-          '，可改用下方“手动直连”', true);
+          '，系统会自动尝试服务器中继', true);
       } else {
         toast('连接出现异常');
       }
@@ -741,11 +646,7 @@
     UI.init({ onCellClick: onCellClick });
     bind();
     if (typeof Peer === 'undefined' && typeof MiniMQTT === 'undefined') {
-      lobbyStatus('联机组件加载失败（需要联网），可直接使用下方“手动直连”', true);
-    }
-    if (typeof RTCPeerConnection === 'undefined') {
-      $('btnShowManual').disabled = true;
-      $('btnShowManual').textContent = '当前浏览器不支持 WebRTC';
+      lobbyStatus('联机组件加载失败（需要联网），请刷新重试', true);
     }
   }
 

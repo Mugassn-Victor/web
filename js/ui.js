@@ -7,6 +7,7 @@ const UI = (function () {
   let onCellClick = null;
   let board = null, svg = null, marks = null, pieceLayer = null;
   const pieceEls = new Map();     // 棋子对象 -> DOM 元素（引用稳定）
+  let lastFxMove = null;          // 防止同一手棋重复播走子动画
 
   /* ---------- 坐标：棋盘(r,c) <-> 视图坐标(viewBox 10x11) ---------- */
   function T(r, c) {
@@ -68,8 +69,9 @@ const UI = (function () {
     const txt = function (p, s) {
       const tr = rot ? ' transform="rotate(180 ' + p[0] + ' ' + p[1] + ')"' : '';
       return '<text x="' + p[0] + '" y="' + p[1] + '"' + tr +
-        ' text-anchor="middle" dominant-baseline="central" font-size="0.62"' +
-        ' font-family="STKaiti,KaiTi,SimSun,serif" fill="#7a5a30" opacity="0.8">' + s + '</text>';
+        ' text-anchor="middle" dominant-baseline="central" font-size="0.72"' +
+        ' letter-spacing="0.18"' +
+        ' font-family="STKaiti,KaiTi,SimSun,serif" fill="#6b4420" opacity="0.9">' + s + '</text>';
     };
     parts.push(txt(t1, '楚 河'));
     parts.push(txt(t2, '汉 界'));
@@ -148,6 +150,7 @@ const UI = (function () {
   function render(state, opts) {
     opts = opts || {};
     const alive = new Set();
+    const lm = opts.lastMove;
 
     for (let r = 0; r < 10; r++) {
       for (let c = 0; c < 9; c++) {
@@ -166,13 +169,47 @@ const UI = (function () {
         const isSel = opts.sel && opts.sel[0] === r && opts.sel[1] === c;
         el.classList.toggle('sel', !!isSel);
         el.classList.toggle('check', opts.checkSide === p.side && p.type === 'K');
+        // 走子动画：一手棋只播一次
+        if (lm && lm !== lastFxMove && lm.to[0] === r && lm.to[1] === c) {
+          el.classList.remove('moving');
+          void el.offsetWidth;
+          el.classList.add('moving');
+          setTimeout(function () { el.classList.remove('moving'); }, 300);
+        }
       }
     }
     pieceEls.forEach(function (el, p) {
-      if (!alive.has(p)) { el.remove(); pieceEls.delete(p); }
+      if (!alive.has(p)) {
+        pieceEls.delete(p);
+        // 被吃的棋子：爆裂光效 + 缩小消失
+        el.classList.add('dying');
+        burstAt(el.style.left, el.style.top);
+        setTimeout(function () { el.remove(); }, 300);
+      }
     });
+    if (lm) lastFxMove = lm;
 
     renderMarks(state, opts);
+  }
+
+  function burstAt(left, top) {
+    if (!left) return;
+    const b = document.createElement('div');
+    b.className = 'mark burst';
+    b.style.left = left;
+    b.style.top = top;
+    marks.appendChild(b);
+    setTimeout(function () { b.remove(); }, 450);
+  }
+
+  // 将军特效：棋盘中央书法大字 + 红光闪烁
+  function fxCheck() {
+    const d = document.createElement('div');
+    d.className = 'check-fx';
+    d.innerHTML = '<span>将 军</span>';
+    board.appendChild(d);
+    board.classList.add('flash');
+    setTimeout(function () { d.remove(); board.classList.remove('flash'); }, 1000);
   }
 
   function mark(cls, r, c) {
@@ -201,6 +238,7 @@ const UI = (function () {
     pieceEls.forEach(function (el) { el.remove(); });
     pieceEls.clear();
     marks.innerHTML = '';
+    lastFxMove = null;
   }
 
   return {
@@ -208,6 +246,7 @@ const UI = (function () {
     setOrientation: setOrientation,
     render: render,
     clear: clear,
+    fxCheck: fxCheck,
     sound: sound
   };
 })();
