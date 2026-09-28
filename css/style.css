@@ -127,6 +127,67 @@ body {
 .waiting { color: var(--muted); font-size: 13px; margin: 14px 0 0; animation: blink 1.4s infinite; }
 @keyframes blink { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
 
+/* ---------- 手动直连 ---------- */
+.alt-line { margin: 16px 0 0; }
+
+.link-btn {
+  appearance: none;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  padding: 4px;
+  font-family: inherit;
+}
+.link-btn:hover { color: var(--accent); }
+
+#manualPanel {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px dashed #3b2f22;
+  text-align: left;
+}
+
+.manual-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 14px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+#manualRoles { display: flex; gap: 10px; justify-content: center; margin-bottom: 6px; }
+
+.mlabel {
+  display: block;
+  font-size: 12px;
+  color: var(--accent);
+  margin: 14px 0 6px;
+}
+
+#manualPanel textarea {
+  width: 100%;
+  background: #17120e;
+  border: 1px solid #4a3a28;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: "Consolas", "Courier New", monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  resize: vertical;
+  word-break: break-all;
+}
+#manualPanel textarea:focus { outline: none; border-color: var(--accent); }
+#manualPanel textarea[readonly] { color: var(--accent); }
+
+.mrow { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+
+#manualPanel .status { margin-top: 10px; min-height: 18px; }
+#manualPanel .alt-line { text-align: center; }
+
 /* ---------- 对局 ---------- */
 #game { display: flex; flex-direction: column; min-height: 100vh; padding-bottom: 20px; }
 

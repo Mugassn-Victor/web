@@ -35,6 +35,53 @@
         </div>
         <p class="waiting">等待对手加入…</p>
       </div>
+
+      <p id="manualEntry" class="alt-line">
+        <button id="btnShowManual" class="link-btn">连不上？改用手动直连（无需任何服务器）</button>
+      </p>
+
+      <!-- 手动直连 -->
+      <div id="manualPanel" class="hidden">
+        <p class="manual-hint">双方复制粘贴两段码即可点对点直连，信令服务器挂了也能玩</p>
+
+        <div id="manualRoles">
+          <button id="btnManualHost" class="btn">我创建房间（执红先行）</button>
+          <button id="btnManualGuest" class="btn">我加入房间（执黑后手）</button>
+        </div>
+
+        <div id="manualHost" class="hidden">
+          <label class="mlabel">① 生成连接码，复制发给对方</label>
+          <textarea id="offerOut" readonly rows="4" placeholder="点下面按钮生成"></textarea>
+          <div class="mrow">
+            <button id="btnGenOffer" class="btn small primary">生成连接码</button>
+            <button id="btnCopyOffer" class="btn small">复制</button>
+          </div>
+          <label class="mlabel">② 粘贴对方发回的应答码，点连接</label>
+          <textarea id="answerIn" rows="4" placeholder="粘贴应答码"></textarea>
+          <div class="mrow">
+            <button id="btnAcceptAnswer" class="btn small">连接</button>
+          </div>
+          <p id="manualStatusHost" class="status"></p>
+        </div>
+
+        <div id="manualGuest" class="hidden">
+          <label class="mlabel">① 粘贴对方的连接码</label>
+          <textarea id="offerIn" rows="4" placeholder="粘贴连接码"></textarea>
+          <div class="mrow">
+            <button id="btnGenAnswer" class="btn small primary">生成应答码</button>
+          </div>
+          <label class="mlabel">② 把应答码复制回给对方，等待连接</label>
+          <textarea id="answerOut" readonly rows="4" placeholder="生成后显示在这里"></textarea>
+          <div class="mrow">
+            <button id="btnCopyAnswer" class="btn small">复制应答码</button>
+          </div>
+          <p id="manualStatusGuest" class="status"></p>
+        </div>
+
+        <p class="alt-line">
+          <button id="btnBackAuto" class="link-btn">返回房间号连接</button>
+        </p>
+      </div>
     </div>
   </section>
 
