@@ -430,7 +430,7 @@
 
   /* ================= 大厅 / 连接 ================= */
 
-  function startGame(side) {
+  function startGame(side, relay) {
     clearTimeout(App.autoTimer);
     App.mySide = side;
     App.history = [];
@@ -447,7 +447,7 @@
     $('roomTag').textContent = App.connMode === 'manual' ? '手动直连' : '房间 ' + App.roomId;
     $('sideTag').textContent = sideName(side) + (side === RED ? '（先手）' : '（后手）');
     const ct = $('connTag');
-    ct.textContent = '已连接';
+    ct.textContent = relay ? '中继连接' : '已连接';
     ct.className = 'tag on';
     banner(null);
 
@@ -666,7 +666,15 @@
     });
 
     Net.on('connected', function (info) {
-      startGame(info.role === 'host' ? RED : BLACK);
+      startGame(info.role === 'host' ? RED : BLACK, !!info.relay);
+    });
+
+    // P2P 打不通 → 已切到 broker 中继，对局继续
+    Net.on('relay', function () {
+      const ct = $('connTag');
+      ct.textContent = '中继连接';
+      ct.className = 'tag on';
+      toast('点对点直连不通，已切换服务器中继，对局继续');
     });
 
     Net.on('data', function (d) {
@@ -714,6 +722,10 @@
     });
 
     Net.on('conn-error', function (e) {
+      if (App.connMode === 'manual') {
+        // 手动面板有自己的 20 秒提示，这里不重复报错
+        return;
+      }
       if (App.phase === 'lobby') {
         lobbyStatus('点对点连接失败：' + (e && e.message ? e.message : 'NAT 打洞不通') +
           '，可改用下方“手动直连”', true);
