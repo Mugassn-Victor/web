@@ -12,6 +12,7 @@ const Net = (function () {
   let dead = false;         // destroy 后忽略一切回调
   let mqttSig = null;       // MQTT 会话：信令 + 消息中继共用连接
   let autoRole = null;      // 'host' | 'guest'（自动联机角色）
+  let lastRoom = null;      // 最近的房间号（掉线恢复时重拨用）
   let p2pTimer = null;      // P2P 等待超时 → 降级中继
   let hbTimer = null;       // 中继模式心跳
   let lastHb = 0;
@@ -47,9 +48,15 @@ const Net = (function () {
     if (dead) return;
     if (settled) {
       if (c === conn) return;
-      if (conn && conn._relay && !c._relay) {   // 中继期间 P2P 迟到打通 → 升级
-        stopSigPublishing();
+      const healthy = conn && conn.open;
+      const lateP2P = healthy && conn._relay && !c._relay;
+      if (!healthy || lateP2P) {
+        // 旧连接已死（对方掉线后重新加入）或中继期间 P2P 迟到打通
         conn = c;
+        clearP2pTimer();
+        stopSignaling();
+        emit('reconnected', { role: role, peer: (c && c.peer) || 'p2p', upgraded: lateP2P });
+        flush();
         return;
       }
       try { c.close(); } catch (e) {}
@@ -65,9 +72,14 @@ const Net = (function () {
 
   function setupConn(c, role) {
     if (settled) {
-      // 中继模式下仍接受迟到的 P2P（升级），否则关掉
-      if (conn && conn._relay) c.on('open', function () { fireConnected(c, role); });
-      else { try { c.close(); } catch (e) {} }
+      const healthy = conn && conn.open;
+      if (healthy && !(conn._relay && !c._relay)) {
+        // 已有健康连接，且不是「中继期间迟到的 P2P」→ 关掉重复连接
+        try { c.close(); } catch (e) {}
+        return;
+      }
+      // 旧连接已死（对方重新加入）或中继期 P2P 迟到 → 打开后由 fireConnected 接管
+      c.on('open', function () { fireConnected(c, role); });
       return;
     }
     startP2pTimer(role);
@@ -191,6 +203,7 @@ const Net = (function () {
     dead = false;
     settled = false;
     autoRole = 'host';
+    lastRoom = roomId;
     pendingData = [];
     startMqttSig(roomId, 'host');
     if (typeof Peer === 'undefined') return;
@@ -203,6 +216,7 @@ const Net = (function () {
     dead = false;
     settled = false;
     autoRole = 'guest';
+    lastRoom = roomId;
     pendingData = [];
     startMqttSig(roomId, 'guest');
     if (typeof Peer === 'undefined') return;
@@ -241,6 +255,21 @@ const Net = (function () {
   function isConnected() { return !!(conn && conn.open); }
 
   function signalingPending() { return !!(mqttSig && !mqttSig.done && !settled); }
+
+  // 断线后由 main.js 周期调用：重建信令总线 + 客方主动重拨房间
+  // （房主掉线重进时以同一房间号重新注册 Peer，等待中的客方重拨即可接上）
+  function resume() {
+    if (dead || !lastRoom) return;
+    if (!(mqttSig && !mqttSig.done && mqttSig.mq && mqttSig.mq._opened)) {
+      startMqttSig(lastRoom, autoRole || 'guest');
+    }
+    if (autoRole === 'guest' && peer && lastRoom) {
+      try {
+        const c = peer.connect(lastRoom, { reliable: true });
+        setupConn(c, 'guest');
+      } catch (e) {}
+    }
+  }
 
   /* ===== 备用信令：公共 MQTT broker（WebSocket 直连，无需注册/自建服务器） ===== */
 
@@ -340,6 +369,7 @@ const Net = (function () {
 
     mq.onerror = function () {};
     mq.onclose = function () {
+      if (mqttSig === st) st.mq = null;   // 总线已断，允许 resume 重建
       if (mqttSig !== st) return;
       if (settled && conn && conn._relay) { clearHb(); emit('closed'); return; }
       if (!st.done && !settled) stopMqttSig();
@@ -471,6 +501,7 @@ const Net = (function () {
     send: send,
     destroy: destroy,
     isConnected: isConnected,
-    signalingPending: signalingPending
+    signalingPending: signalingPending,
+    resume: resume
   };
 })();

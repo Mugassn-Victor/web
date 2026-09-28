@@ -342,6 +342,11 @@
         if (!Array.isArray(msg.hist)) return;
         const test = Rules.derive(msg.hist);
         if (!test) return;
+        // 只接受更长（或不同）的棋谱：防止重新加入时空棋谱覆盖对方的进行中棋局
+        const longer = msg.hist.length > App.history.length;
+        const diff = msg.hist.length === App.history.length &&
+          JSON.stringify(msg.hist) !== JSON.stringify(App.history);
+        if (!longer && !diff) return;
         App.history = msg.hist;
         App.sel = null;
         App.targets = [];
@@ -428,6 +433,20 @@
 
   /* ================= 大厅 / 连接 ================= */
 
+  /* --- 断线后周期重连：等对方重新加入，或自己这边自动恢复 --- */
+  let resumeTimer = null;
+  function startResumeRetry() {
+    if (resumeTimer) return;
+    Net.resume();
+    resumeTimer = setInterval(function () {
+      if (App.disconnected) Net.resume();
+      else stopResumeRetry();
+    }, 5000);
+  }
+  function stopResumeRetry() {
+    if (resumeTimer) { clearInterval(resumeTimer); resumeTimer = null; }
+  }
+
   function startGame(side, relay) {
     stopWait();
     App.mySide = side;
@@ -451,6 +470,13 @@
 
     UI.setOrientation(side);
     render();
+
+    // 记住本局房间，误关页面后可恢复（startGame 才算真正入局）
+    try {
+      localStorage.setItem('xq-resume', JSON.stringify({
+        code: App.roomId, mode: App.mode, side: side, ts: Date.now()
+      }));
+    } catch (e) {}
   }
 
   /* --- 加入房间倒计时 --- */
@@ -481,11 +507,12 @@
     }, 1000);
   }
 
-  function createRoom() {
+  function createRoom(code, recovering) {
     App.mode = 'host';
+    App.recovering = !!recovering;
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
-    App.roomId = randCode();
+    App.roomId = code || randCode();
     App.hostRetries = 0;
     // 房间号本地生成，不依赖信令服务器回传，立即显示
     $('roomCode').textContent = App.roomId;
@@ -516,6 +543,8 @@
   }
 
   function leaveToLobby() {
+    try { localStorage.removeItem('xq-resume'); } catch (e) {}
+    stopResumeRetry();
     Net.destroy();
     location.reload();
   }
@@ -523,7 +552,7 @@
   /* ================= 事件绑定 ================= */
 
   function bind() {
-    $('btnCreate').onclick = createRoom;
+    $('btnCreate').onclick = function () { createRoom(); };
     $('btnJoin').onclick = joinRoom;
     $('roomInput').addEventListener('input', function (e) {
       e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
@@ -576,6 +605,8 @@
 
     Net.on('connected', function (info) {
       startGame(info.role === 'host' ? RED : BLACK, !!info.relay);
+      // 请求棋谱：若对方是进行中的棋局（自己刚重新加入），会同步恢复局面
+      Net.send({ t: 'sync-req' });
     });
 
     // P2P 打不通 → 已切到 broker 中继，对局继续
@@ -594,19 +625,48 @@
     });
 
     Net.on('closed', function () {
+      if (App.phase === 'lobby') {
+        lobbyStatus('连接中断，请重试', true);
+        backToButtons();
+        return;
+      }
       App.disconnected = true;
       const ct = $('connTag');
       ct.textContent = '连接已断开';
       ct.className = 'tag off';
-      banner('对方已断线，棋局暂停');
+      banner('对方掉线，棋局暂停，等待重新连线…');
       render();
-      modal('连接断开', '对方已离开，无法继续对局', [
-        { label: '返回大厅', primary: true, onClick: leaveToLobby }
-      ]);
+      startResumeRetry();
+      if (App.phase !== 'over') {
+        modal('对方掉线', '对方离开了对局页面。对方重新进入同一房间号后，棋局会自动恢复。', [
+          { label: '等待重连', primary: true, onClick: closeModal },
+          { label: '返回大厅', onClick: leaveToLobby }
+        ]);
+      }
+    });
+
+    // 对方重新加入（或直连恢复）：清掉断线状态，继续对局
+    Net.on('reconnected', function () {
+      const wasOff = App.disconnected;
+      App.disconnected = false;
+      stopResumeRetry();
+      banner(null);
+      const ct = $('connTag');
+      ct.textContent = '已连接';
+      ct.className = 'tag on';
+      if ($('modalTitle').textContent === '对方掉线') closeModal();
+      render();
+      toast(wasOff ? '对方已重新连线，对局继续' : '点对点直连已恢复');
     });
 
     Net.on('error', function (e) {
       const type = e && e.type;
+      if (App.mode === 'host' && type === 'unavailable-id' && App.recovering) {
+        lobbyStatus('原房间号仍被占用（原页面可能还没关闭），请关闭旧页面后再恢复', true);
+        App.recovering = false;
+        backToButtons();
+        return;
+      }
       if (App.mode === 'host' && type === 'unavailable-id' && App.hostRetries < 3) {
         App.hostRetries++;
         App.roomId = randCode();
@@ -620,6 +680,7 @@
         lobbyStatus('主信令不通，正在尝试备用信令…');
         return;
       }
+      if (App.phase !== 'lobby') return;   // 对局中出错交给断线重连机制，不打断棋局
       if (App.mode === 'guest' && type === 'peer-unavailable') {
         lobbyStatus('房间不存在或对方已离开', true);
       } else if (type === 'network' || type === 'server-error' || type === 'socket-error') {
@@ -647,6 +708,22 @@
     bind();
     if (typeof Peer === 'undefined' && typeof MiniMQTT === 'undefined') {
       lobbyStatus('联机组件加载失败（需要联网），请刷新重试', true);
+    }
+    // 误关页面后恢复：显示上次的房间入口
+    let resume = null;
+    try { resume = JSON.parse(localStorage.getItem('xq-resume')); } catch (e) {}
+    if (resume && /^\d{6}$/.test(resume.code)) {
+      $('resumeRow').classList.remove('hidden');
+      $('resumeInfo').textContent = '房间 ' + resume.code + '（' +
+        (resume.side === RED ? '你执红方' : '你执黑方') + '）';
+      $('btnResume').onclick = function () {
+        if (resume.mode === 'host') {
+          createRoom(resume.code, true);
+        } else {
+          $('roomInput').value = resume.code;
+          joinRoom();
+        }
+      };
     }
   }
 
