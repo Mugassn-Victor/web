@@ -455,15 +455,15 @@
     render();
   }
 
-  // 信令服务器连不上时给出超时提示，并引导到手动直连
+  // 备用信令也连不上时给出超时提示，并引导到手动直连
   function startAutoTimer() {
     clearTimeout(App.autoTimer);
     App.autoTimer = setTimeout(function () {
       if (App.phase !== 'lobby' || Net.isConnected()) return;
-      lobbyStatus('连接超时：信令服务器可能被网络拦截，请用下方“手动直连”', true);
+      lobbyStatus('连接超时：备用信令也没连上，请用下方“手动直连”复制码连接', true);
       backToButtons();
       showManual();
-    }, 12000);
+    }, 16000);
   }
 
   function showManual() {
@@ -487,28 +487,21 @@
   }
 
   function createRoom() {
-    if (typeof Peer === 'undefined') {
-      lobbyStatus('无法加载联机组件，请改用手动直连', true);
-      showManual();
-      return;
-    }
     App.mode = 'host';
     App.connMode = 'auto';
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
-    lobbyStatus('正在创建房间…');
     App.roomId = randCode();
     App.hostRetries = 0;
+    // 房间号本地生成，不依赖信令服务器回传，立即显示
+    $('roomCode').textContent = App.roomId;
+    $('hostPanel').classList.remove('hidden');
+    lobbyStatus('正在创建房间…');
     Net.create(App.roomId);
     startAutoTimer();
   }
 
   function joinRoom() {
-    if (typeof Peer === 'undefined') {
-      lobbyStatus('无法加载联机组件，请改用手动直连', true);
-      showManual();
-      return;
-    }
     const val = $('roomInput').value.trim().toUpperCase();
     if (!/^[A-Z0-9]{4,8}$/.test(val)) {
       lobbyStatus('请输入有效的房间号', true);
@@ -594,7 +587,7 @@
       Net.manualAccept(v).then(function () {
         setTimeout(function () {
           if (App.phase === 'lobby' && !Net.isConnected()) {
-            manualStatus('host', '连接失败：双方网络无法直连，建议连同一 Wi-Fi 重试', true);
+            manualStatus('host', '连接失败：双方网络难以直连，可返回重新生成连接码再试', true);
           }
         }, 20000);
       }).catch(function (e) {
@@ -700,8 +693,14 @@
       if (App.mode === 'host' && type === 'unavailable-id' && App.hostRetries < 3) {
         App.hostRetries++;
         App.roomId = randCode();
+        $('roomCode').textContent = App.roomId;
         Net.create(App.roomId);
         lobbyStatus('房间号冲突，正在换号…');
+        return;
+      }
+      // 主信令报错但备用信令还在尝试：继续等，不打断
+      if (Net.signalingPending()) {
+        lobbyStatus('主信令不通，正在尝试备用信令…');
         return;
       }
       if (App.mode === 'guest' && type === 'peer-unavailable') {
@@ -717,7 +716,7 @@
     Net.on('conn-error', function (e) {
       if (App.phase === 'lobby') {
         lobbyStatus('点对点连接失败：' + (e && e.message ? e.message : 'NAT 打洞不通') +
-          '，建议双方连同一 Wi-Fi 再试', true);
+          '，可改用下方“手动直连”', true);
       } else {
         toast('连接出现异常');
       }
@@ -729,10 +728,8 @@
   function boot() {
     UI.init({ onCellClick: onCellClick });
     bind();
-    if (typeof Peer === 'undefined') {
+    if (typeof Peer === 'undefined' && typeof MiniMQTT === 'undefined') {
       lobbyStatus('联机组件加载失败（需要联网），可直接使用下方“手动直连”', true);
-      $('btnCreate').disabled = true;
-      $('btnJoin').disabled = true;
     }
     if (typeof RTCPeerConnection === 'undefined') {
       $('btnShowManual').disabled = true;
