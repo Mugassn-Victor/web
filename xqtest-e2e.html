@@ -233,6 +233,8 @@ async function waitRejoined(i, n, budgetMs) {
     const undone1 = await until(() => histLen(0) === 1 && histLen(1) === 1, 300);
     check('悔棋只退一步(2→1)', undone1, histLen(0) + '/' + histLen(1));
     check('退一步后轮到黑方', txt(1, 'turnTag').indexOf('黑方走棋（你）') === 0, txt(1, 'turnTag'));
+    check('发起方(黑)不弹同意框', !(modalVisible(1) && txt(1, 'modalTitle') === '悔棋请求'),
+      txt(1, 'modalTitle'));
 
     click(1, 'btnUndo');   // 轮次方(黑)再退一步 → 回到开局
     const rModal = await until(() => modalVisible(0) && txt(0, 'modalTitle') === '悔棋请求');
@@ -242,6 +244,8 @@ async function waitRejoined(i, n, budgetMs) {
     const undone = await until(() => histLen(0) === 0 && histLen(1) === 0, 300);
     check('两次悔棋后回到开局', undone, histLen(0) + '/' + histLen(1));
     check('悔棋后回到红方', txt(0, 'turnTag').indexOf('红方走棋（你）') === 0, txt(0, 'turnTag'));
+    check('二次悔棋发起方仍无同意框', !(modalVisible(1) && txt(1, 'modalTitle') === '悔棋请求'),
+      txt(1, 'modalTitle'));
 
     // ===== 5. 认输 =====
     click(0, 'btnResign');
