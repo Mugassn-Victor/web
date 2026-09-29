@@ -264,10 +264,12 @@ async function waitRejoined(i, n, budgetMs) {
     const restarted = await until(() =>
       histLen(0) === 0 && histLen(1) === 0 &&
       !modalVisible(0) && !modalVisible(1) &&
-      txt(0, 'turnTag').indexOf('红方走棋') === 0, 400);
+      txt(0, 'turnTag') === '红方走棋' &&
+      txt(1, 'turnTag') === '红方走棋（你）', 400);
     check('双方重新开局', restarted,
-      'h0=' + histLen(0) + ' h1=' + histLen(1) + ' turn=' + txt(0, 'turnTag'));
-    check('重开后A仍为红方', side(0) === 'r', txt(0, 'sideTag'));
+      'h0=' + histLen(0) + ' h1=' + histLen(1) + ' turn=' + txt(0, 'turnTag') + '/' + txt(1, 'turnTag'));
+    check('重开后红黑互换', side(0) === 'b' && side(1) === 'r',
+      txt(0, 'sideTag') + '/' + txt(1, 'sideTag'));
     check('重开后棋子复位', pieceCount(0) === 32 && pieceCount(1) === 32,
       pieceCount(0) + '/' + pieceCount(1));
     check('无断线横幅', hidden(0, 'banner'));
@@ -279,10 +281,10 @@ async function waitRejoined(i, n, budgetMs) {
     check('不在浏览器存房间号(hash)', hashOf(0) === '' && hashOf(1) === '',
       hashOf(0) + '/' + hashOf(1));
 
-    // ===== 8. 客方退出重开页面后输号重新加入 =====
-    cellClick(0, 7, 7); cellClick(0, 7, 4);           // 红 炮二平五
+    // ===== 8. 客方退出重开页面后输号重新加入（重开后互换：客方执红先手） =====
+    cellClick(1, 7, 7); cellClick(1, 7, 4);           // 红 炮二平五
     await waitSync(1);
-    cellClick(1, 0, 1); cellClick(1, 2, 2);           // 黑 马2进3
+    cellClick(0, 0, 1); cellClick(0, 2, 2);           // 黑 马2进3
     await waitSync(2);
     reloadFrame(1);
     log('step8: 已刷新客方，等待就绪');
@@ -302,10 +304,11 @@ async function waitRejoined(i, n, budgetMs) {
       check('客方棋谱恢复', histLen(1) === 2 && eqMv(hist(1), 0, [7, 7], [7, 4]) &&
         eqMv(hist(1), 1, [0, 1], [2, 2]), JSON.stringify(hist(1)));
       check('房主侧棋局保持', histLen(0) === 2, histLen(0));
+      check('客方互换后执红', side(1) === 'r', txt(1, 'sideTag'));
       check('房主侧掉线弹窗清除', !modalVisible(0) && !disconnected(0),
         'modal=' + modalVisible(0) + ' disc=' + disconnected(0));
-      // 继续走子：红 (7,4)->(7,3)
-      cellClick(0, 7, 4); cellClick(0, 7, 3);
+      // 继续走子：红方（客方 B）(7,4)->(7,3)
+      cellClick(1, 7, 4); cellClick(1, 7, 3);
       const c1 = await waitSync(3);
       check('重连后可继续走子', c1 && eqMv(hist(0), 2, [7, 4], [7, 3]),
         c1 ? JSON.stringify(hist(0)[2]) : 'timeout');
@@ -324,12 +327,12 @@ async function waitRejoined(i, n, budgetMs) {
         ' room=' + txt(0, 'roomTag'));
       check('房主棋谱恢复', histLen(0) === 3 && eqMv(hist(0), 2, [7, 4], [7, 3]),
         JSON.stringify(hist(0)));
-      check('房主仍执红方', side(0) === 'r', txt(0, 'sideTag'));
+      check('房主互换后执黑', side(0) === 'b', txt(0, 'sideTag'));
       check('对手侧仍在进行', histLen(1) === 3 && !disconnected(1) && !modalVisible(1),
         'hist=' + histLen(1) + ' disc=' + disconnected(1));
-      // 继续走子：此时轮到黑方 → B 马 (2,2)->(1,4)
-      cellClick(1, 2, 2);
-      cellClick(1, 1, 4);
+      // 继续走子：此时轮到黑方（房主 A 执黑）→ 马 (2,2)->(1,4)
+      cellClick(0, 2, 2);
+      cellClick(0, 1, 4);
       const c2 = await waitSync(4);
       check('房主重进后继续走子', c2 && eqMv(hist(1), 3, [2, 2], [1, 4]),
         c2 ? JSON.stringify(hist(1)[3]) : 'timeout');

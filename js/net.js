@@ -16,6 +16,7 @@ const Net = (function () {
   let p2pTimer = null;      // P2P 等待超时 → 降级中继
   let hbTimer = null;       // 中继模式心跳
   let lastHb = 0;
+  let peerGone = false;     // 心跳超时判对方掉线后置位；对方消息再到达时复活心跳并报重连
   let lastPunch = 0;        // 中继模式下背景打洞的节流
   let relayWanted = false;
   let pendingData = [];     // 连接建立前收到的消息，先缓存
@@ -66,6 +67,7 @@ const Net = (function () {
         conn = c;
         clearP2pTimer();
         stopSignaling();
+        peerGone = false;
         tr('fire-upgrade role=' + role);
         emit('reconnected', { role: role, peer: (c && c.peer) || 'p2p', upgraded: lateP2P });
         flush();
@@ -78,25 +80,15 @@ const Net = (function () {
     conn = c;
     clearP2pTimer();
     stopSignaling();
+    peerGone = false;
     tr('fire-first role=' + role + ' relay=' + !!(c && c._relay));
     emit('connected', { role: role, peer: (c && c.peer) || 'p2p' });
     flush();
   }
 
   function setupConn(c, role) {
-    if (settled) {
-      const healthy = conn && conn.open;
-      if (healthy && !(conn._relay && !c._relay)) {
-        // 已有健康连接，且不是「中继期间迟到的 P2P」→ 关掉重复连接
-        try { c.close(); } catch (e) {}
-        return;
-      }
-      // 旧连接已死（对方重新加入）或中继期 P2P 迟到 → 打开后由 fireConnected 接管
-      c.on('open', function () { fireConnected(c, role); });
-      return;
-    }
-    startP2pTimer(role);
-    c.on('open', function () { fireConnected(c, role); });
+    // 监听必须先挂上（含接管场景）：对方刷新重连时旧连接已死，新连接会被 fireConnected
+    // 接管成 conn，若此时没挂 data 监听，接管后就永远收不到对方消息（c===conn 守卫无处生效）
     c.on('data', function (d) { if (c === conn) deliver(d); });
     c.on('close', function () {
       if (dead) return;
@@ -112,6 +104,19 @@ const Net = (function () {
       }
     });
     c.on('error', function (e) { if (!dead && (c === conn || !settled)) emit('conn-error', e); });
+    if (settled) {
+      const healthy = conn && conn.open;
+      if (healthy && !(conn._relay && !c._relay)) {
+        // 已有健康连接，且不是「中继期间迟到的 P2P」→ 关掉重复连接
+        try { c.close(); } catch (e) {}
+        return;
+      }
+      // 旧连接已死（对方重新加入）或中继期 P2P 迟到 → 打开后由 fireConnected 接管
+      c.on('open', function () { fireConnected(c, role); });
+      return;
+    }
+    startP2pTimer(role);
+    c.on('open', function () { fireConnected(c, role); });
   }
 
   function stopSignaling() {
@@ -152,6 +157,7 @@ const Net = (function () {
     settled = true;
     conn = makeRelayWrap();
     clearP2pTimer();
+    peerGone = false;
     startHb();
     emit('connected', { role: role, peer: 'relay', relay: true });
     flush();
@@ -172,7 +178,8 @@ const Net = (function () {
     if (!busReady()) { tr('send-skip nobus ' + (o && o.t)); return false; }
     try {
       tr('send ' + (o && o.t));
-      mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'm', d: o }));
+      // 带上自己的 sid：broker 会把消息回给发布者本人，收端靠 sid 过滤掉自己发的
+      mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'm', d: o, sid: mqttSig.sid }));
       return true;
     } catch (e) { tr('send-err ' + e); return false; }
   }
@@ -183,7 +190,7 @@ const Net = (function () {
     hbTimer = setInterval(function () {
       if (!settled || !conn || !conn._relay) { clearHb(); return; }
       if (busReady()) {
-        try { mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'hb' })); } catch (e) {}
+        try { mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'hb', sid: mqttSig.sid })); tr('hb-s'); } catch (e) {}
       }
       // 背景慢慢打洞：中继模式下房主周期性重发 offer，打通即自动升级直连
       if (autoRole === 'host' && !hostHealthy() && mqttSig && mqttSig.ensureOffer &&
@@ -192,7 +199,7 @@ const Net = (function () {
         tr('bg-punch');
         mqttSig.ensureOffer();
       }
-      if (Date.now() - lastHb > HB_MAX) { clearHb(); emit('closed'); }
+      if (Date.now() - lastHb > HB_MAX) { clearHb(); peerGone = true; tr('hb-timeout age=' + (Date.now() - lastHb)); emit('closed'); }
     }, HB_INT);
   }
 
@@ -427,12 +434,23 @@ const Net = (function () {
     };
 
     mq.onmessage = function (t, payload) {
-      if (st.done || dead) return;
+      if (st.done || dead) { if (t === dataTopic) tr('dt-drop ' + (dead ? 'dead' : 'done')); return; }
       let m;
       try { m = JSON.parse(payload); } catch (e) { return; }
       if (t === dataTopic) {
-        // 消息中继通道：心跳 + 对局消息
+        // 消息中继通道：心跳 + 对局消息（先滤掉自己发出去的回声，否则 lastHb 永远新鲜、
+        // 自己的 undo-ok/restart-ok 会被自己再执行一遍）
+        if (m && m.k === 'hb') tr(m.sid === st.sid ? 'hb-own' : 'hb-r');
+        if (m && m.sid === st.sid) return;
         lastHb = Date.now();
+        // 对方掉线被判死后，收到对方消息 = 对方已回来：复活自己的心跳（否则对方等不到
+        // 我方 hb 也会超时互判掉线），并向上报重连以清理断线状态/弹窗
+        if (peerGone) {
+          peerGone = false;
+          tr('hb-revive');
+          startHb();
+          emit('reconnected', { role: autoRole, peer: 'relay' });
+        }
         if (m && m.k === 'm' && m.d !== undefined) { tr('recv ' + (m.d && m.d.t)); deliver(m.d); }
         return;
       }

@@ -10,6 +10,7 @@
     history: [],        // [{from:[r,c], to:[r,c]}] —— 局面唯一真相
     state: null,        // derive(history)
     mySide: null,
+    swapped: false,      // 再来一局后红黑是否已互换（刷新页面后由 sync 标记恢复）
     roomId: null,
     mode: null,         // 'host' | 'guest'
     phase: 'lobby',     // lobby | playing | over
@@ -263,6 +264,9 @@
     App.pendingRestart = false;
     App.pendingUndo = false;
     App.phase = 'playing';
+    // 再来一局：双方红黑互换
+    App.swapped = !App.swapped;
+    flipSide();
     recompute();
     closeModal();
     render();
@@ -285,13 +289,18 @@
         break;
       }
       case 'sync-req': {
-        Net.send({ t: 'sync', hist: App.history });
+        Net.send({ t: 'sync', hist: App.history, swap: App.swapped });
         break;
       }
       case 'sync': {
         if (!Array.isArray(msg.hist)) return;
         const test = Rules.derive(msg.hist);
         if (!test) return;
+        // 刷新重进后按对方棋谱带的互换标记恢复自己这一方（先应用再判长短，空棋谱也要能恢复）
+        if (typeof msg.swap === 'boolean' && msg.swap !== App.swapped) {
+          App.swapped = msg.swap;
+          if (App.mySide === RED || App.mySide === BLACK) { flipSide(); if (App.state) render(); }
+        }
         // 只接受更长（或不同）的棋谱：防止重新加入时空棋谱覆盖对方的进行中棋局
         const longer = msg.hist.length > App.history.length;
         const diff = msg.hist.length === App.history.length &&
@@ -395,6 +404,18 @@
   }
   function stopResumeRetry() {
     if (resumeTimer) { clearInterval(resumeTimer); resumeTimer = null; }
+  }
+
+  function sideForRole(role) {
+    const base = role === 'host' ? RED : BLACK;
+    if (!App.swapped) return base;
+    return base === RED ? BLACK : RED;
+  }
+
+  function flipSide() {
+    App.mySide = App.mySide === RED ? BLACK : RED;
+    $('sideTag').textContent = sideName(App.mySide) + (App.mySide === RED ? '（先手）' : '（后手）');
+    UI.setOrientation(App.mySide);
   }
 
   function startGame(side, relay) {
@@ -549,7 +570,7 @@
     });
 
     Net.on('connected', function (info) {
-      startGame(info.role === 'host' ? RED : BLACK, !!info.relay);
+      startGame(sideForRole(info.role), !!info.relay);
       // 请求棋谱：若对方是进行中的棋局（自己刚重新加入），会同步恢复局面
       Net.send({ t: 'sync-req' });
       // 公共 broker 是 QoS0，sync-req 偶发丢失会让棋谱永远空着 → 恢复前重试
@@ -609,7 +630,7 @@
       render();
       toast(wasOff ? '对方已重新连线，对局继续' : '点对点直连已恢复');
       // 主动推棋谱：对方可能刚重新进入页面，其 sync-req 可能早于通道就绪被丢弃
-      if (App.history.length) Net.send({ t: 'sync', hist: App.history });
+      if (App.history.length) Net.send({ t: 'sync', hist: App.history, swap: App.swapped });
     });
 
     Net.on('error', function (e) {
