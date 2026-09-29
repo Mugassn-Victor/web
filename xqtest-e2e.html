@@ -74,6 +74,7 @@ function modalBtn(i, label) {
 }
 function modalVisible(i) { return !hidden(i, 'overlay'); }
 function side(i) { return txt(i, 'sideTag').indexOf('红方') === 0 ? 'r' : 'b'; }
+function hashOf(i) { const w = W(i); return w ? w.location.hash : '?'; }
 function cellClick(i, r, c) {
   const board = g(i, 'board');
   if (!board) return;
@@ -91,7 +92,7 @@ function cellClick(i, r, c) {
 }
 function reloadFrame(i) {
   const f = document.getElementById(FRAME_IDS[i]);
-  // 用 reload 保留 hash（直接赋同 URL 只会做 fragment 导航，不重载）
+  // 用 reload（直接赋同 URL 只会做 fragment 导航，不重载）
   try { f.contentWindow.location.reload(); }
   catch (e) { f.src = PAGE; }
 }
@@ -105,8 +106,8 @@ async function waitSync(n, tries) {
   const ok = await until(() => histLen(0) === n && histLen(1) === n, tries || 300);
   return ok;
 }
-async function waitRejoined(i, n) {
-  const end = performance.now() + 60000;
+async function waitRejoined(i, n, budgetMs) {
+  const end = performance.now() + (budgetMs || 60000);
   let lastLog = 0;
   let wrSpin = 0;
   while (performance.now() < end) {
@@ -223,14 +224,23 @@ async function waitRejoined(i, n) {
     check('非法落点不产生走法', histLen(0) === 2 && histLen(1) === 2,
       histLen(0) + '/' + histLen(1));
 
-    // ===== 4. 悔棋 =====
-    click(0, 'btnUndo');
-    const bModal = await until(() => modalVisible(1) && txt(1, 'modalTitle') === '悔棋请求');
-    check('黑方收到悔棋请求', bModal, txt(1, 'modalTitle'));
-    const agree = modalBtn(1, '同意');
+    // ===== 4. 悔棋：退一步，双方无论轮次均可发起 =====
+    click(1, 'btnUndo');   // 非轮次方(黑)也可发起
+    const bModal = await until(() => modalVisible(0) && txt(0, 'modalTitle') === '悔棋请求');
+    check('红方收到黑方悔棋请求', bModal, txt(0, 'modalTitle'));
+    const agree = modalBtn(0, '同意');
     if (agree) agree.click();
-    const undone = await waitSync(0);
-    check('悔棋后双方记录清空', undone, histLen(0) + '/' + histLen(1));
+    const undone1 = await until(() => histLen(0) === 1 && histLen(1) === 1, 300);
+    check('悔棋只退一步(2→1)', undone1, histLen(0) + '/' + histLen(1));
+    check('退一步后轮到黑方', txt(1, 'turnTag').indexOf('黑方走棋（你）') === 0, txt(1, 'turnTag'));
+
+    click(1, 'btnUndo');   // 轮次方(黑)再退一步 → 回到开局
+    const rModal = await until(() => modalVisible(0) && txt(0, 'modalTitle') === '悔棋请求');
+    check('红方再次收到悔棋请求', rModal, txt(0, 'modalTitle'));
+    const agree2 = modalBtn(0, '同意');
+    if (agree2) agree2.click();
+    const undone = await until(() => histLen(0) === 0 && histLen(1) === 0, 300);
+    check('两次悔棋后回到开局', undone, histLen(0) + '/' + histLen(1));
     check('悔棋后回到红方', txt(0, 'turnTag').indexOf('红方走棋（你）') === 0, txt(0, 'turnTag'));
 
     // ===== 5. 认输 =====
@@ -262,9 +272,12 @@ async function waitRejoined(i, n) {
       pieceCount(0) + '/' + pieceCount(1));
     check('无断线横幅', hidden(0, 'banner'));
 
-    // ===== 7. 已删除的面板 =====
+    // ===== 7. 已删除的面板/提示/房间记忆 =====
     check('棋谱面板已删除', !g(0, 'moveLog') && !g(1, 'moveLog'));
     check('被吃棋子面板已删除', !g(0, 'capMine') && !g(1, 'capMine'));
+    check('操作提示行已删除', !g(0, 'hint') && !g(1, 'hint'));
+    check('不在浏览器存房间号(hash)', hashOf(0) === '' && hashOf(1) === '',
+      hashOf(0) + '/' + hashOf(1));
 
     // ===== 8. 客方退出重开页面后输号重新加入 =====
     cellClick(0, 7, 7); cellClick(0, 7, 4);           // 红 炮二平五
@@ -298,14 +311,15 @@ async function waitRejoined(i, n) {
         c1 ? JSON.stringify(hist(0)[2]) : 'timeout');
     }
 
-    // ===== 9. 房主退出重开页面后输号接管（静默身份记忆） =====
+    // ===== 9. 房主退出重开页面后输号接管（无浏览器记忆，走倒计时/信令兜底自动建房） =====
     reloadFrame(0);
     const r2 = await waitReady(0);
     check('房主页面重新加载', r2);
     if (r2) {
       g(0, 'roomInput').value = code;
       click(0, 'btnJoin');
-      const taken = await waitRejoined(0, 3);
+      // 无身份记忆 → 走「无人应答 45 秒后自动用该号建房」或 peer-unavailable 兜底（坏信令环境，预算放宽）
+      const taken = await waitRejoined(0, 3, 150000);
       check('房主重新输号接管房间', taken, 'hist=' + histLen(0) + ' vis=' + gameVisible(0) +
         ' room=' + txt(0, 'roomTag'));
       check('房主棋谱恢复', histLen(0) === 3 && eqMv(hist(0), 2, [7, 4], [7, 3]),
@@ -357,6 +371,20 @@ async function waitRejoined(i, n) {
           pieceCount(0) + '/' + pieceCount(1));
       }
     }
+
+    // ===== 10.5 过河兵可以左右移动 =====
+    cellClick(1, 6, 0); cellClick(1, 5, 0);            // 红 兵 (6,0)->(5,0)
+    await waitSync(1);
+    cellClick(0, 0, 1); cellClick(0, 2, 2);            // 黑 马2进3
+    await waitSync(2);
+    cellClick(1, 5, 0); cellClick(1, 4, 0);            // 红 兵 (5,0)->(4,0) 过河
+    await waitSync(3);
+    cellClick(0, 0, 7); cellClick(0, 2, 6);            // 黑 马8进7
+    await waitSync(4);
+    cellClick(1, 4, 0); cellClick(1, 4, 1);            // 红 过河兵横走 (4,0)->(4,1)
+    const sideStep = await waitSync(5);
+    check('过河兵可左右移动', sideStep && eqMv(hist(1), 4, [4, 0], [4, 1]),
+      sideStep ? JSON.stringify(hist(1)[4]) : 'timeout');
 
     // ===== 11. 绝杀特效可视化（截图用） =====
     try {

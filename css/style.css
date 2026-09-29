@@ -266,7 +266,6 @@ body {
   z-index: 4;
 }
 
-/* 绿灯/红灯落点提示已按需求移除 */
 .mark.square {
   width: 9.2%;
   aspect-ratio: 1;
@@ -339,8 +338,6 @@ body {
   75%  { transform: scale(1.06) rotate(0deg); opacity: 1; }
   100% { transform: scale(1.4); opacity: 0; }
 }
-
-.hint { color: var(--muted); font-size: 12px; margin: 10px 0 0; text-align: center; }
 
 /* ---------- 侧面板 ---------- */
 .panel {

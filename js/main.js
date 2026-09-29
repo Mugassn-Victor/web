@@ -125,7 +125,7 @@
     // 按钮状态
     const busy = App.disconnected;
     $('btnUndo').disabled = busy || App.phase !== 'playing' || App.pendingUndo ||
-      App.history.length < 2 || !myTurn();
+      App.history.length < 1;
     $('btnResign').disabled = busy || App.phase !== 'playing';
     $('btnRestart').disabled = busy || App.phase !== 'over' || App.pendingRestart;
   }
@@ -231,7 +231,8 @@
   /* ================= 悔棋 / 重开 ================= */
 
   function requestUndo() {
-    if (App.pendingUndo || App.phase !== 'playing' || App.history.length < 2 || !myTurn()) return;
+    // 退一步：无论轮到谁、无论谁发起，对方同意后棋盘退回上一手
+    if (App.pendingUndo || App.phase !== 'playing' || App.history.length < 1) return;
     App.pendingUndo = true;
     Net.send({ t: 'undo-req' });
     render();
@@ -239,13 +240,13 @@
   }
 
   function applyUndo() {
-    App.history.splice(-2);
+    App.history.splice(-1);
     App.sel = null;
     App.targets = [];
     App.pendingUndo = false;
     recompute();
     render();
-    toast('悔棋成功');
+    toast('悔棋成功，退回上一步');
   }
 
   function requestRestart() {
@@ -308,7 +309,7 @@
         break;
       }
       case 'undo-req': {
-        if (App.phase !== 'playing' || App.history.length < 2) {
+        if (App.phase !== 'playing' || App.history.length < 1) {
           Net.send({ t: 'undo-no' });
           return;
         }
@@ -419,10 +420,6 @@
 
     UI.setOrientation(side);
     render();
-
-    // 静默记住本局身份：掉线重开页面后，输同一个房间号可自动接管重建。
-    // 用 location.hash（每个框架各自独立；localStorage 同源共享会被对手覆盖）
-    location.hash = 'r=' + App.mode + '-' + App.roomId;
   }
 
   /* --- 加入房间倒计时 --- */
@@ -455,13 +452,13 @@
   }
 
   function createRoom(code, recovering) {
+    stopWait();   // 兜底建房时停掉加入倒计时，别让它覆盖建房提示
     App.mode = 'host';
     App.recovering = !!recovering;
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
     App.roomId = code || randCode();
     App.hostRetries = 0;
-    location.hash = 'r=host-' + App.roomId;
     // 房间号本地生成，不依赖信令服务器回传，立即显示
     $('roomCode').textContent = App.roomId;
     $('hostPanel').classList.remove('hidden');
@@ -475,16 +472,9 @@
       lobbyStatus('请输入 6 位数字房间号', true);
       return;
     }
-    // 静默身份记忆（location.hash，按框架独立）：我上次是这个房间的房主 → 直接用该号重建
-    const hm = /^#r=host-(\d{6})$/.exec(location.hash);
-    if (hm && hm[1] === val) {
-      lobbyStatus('正在恢复你的房间…');
-      createRoom(val, true);
-      return;
-    }
+    // 不在浏览器里存房间号：双方线下沟通房间号，直接输号加入
     App.mode = 'guest';
     App.roomId = val;
-    location.hash = 'r=guest-' + val;
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
     Net.join(val);
@@ -499,7 +489,6 @@
   }
 
   function leaveToLobby() {
-    location.hash = '';
     stopResumeRetry();
     Net.destroy();
     location.reload();
@@ -626,11 +615,9 @@
     Net.on('error', function (e) {
       const type = e && e.type;
       if (App.mode === 'host' && type === 'unavailable-id' && App.recovering) {
-        // 该号已有一个活着的房间（旧页面还开着，或身份记忆被其他标签页覆盖）
-        // → 不卡住，直接改以客方身份加入，进局后同步恢复棋谱
+        // 该号已有一个活着的房间（旧会话未释放）→ 不卡住，直接改以客方身份加入，进局后同步恢复棋谱
         App.recovering = false;
         App.mode = 'guest';
-        location.hash = 'r=guest-' + App.roomId;
         Net.destroy();
         $('hostPanel').classList.add('hidden');
         $('roomCode').textContent = '------';

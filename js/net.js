@@ -1,7 +1,7 @@
 /* 联机封装。三层传输，逐级兜底：
-   1) WebRTC P2P 直连（PeerJS 主信令 或 MQTT 备用信令交换 SDP）
-   2) P2P 打不通（打洞失败/无 TURN）→ 对局消息走 MQTT broker 中继（延迟略高，仍可玩）
-   3) 中继期间有心跳，对方真正断开 12 秒内检测到；P2P 迟到打通自动升级回直连 */
+   1) 加入即走 broker 中继先连上（双方总线一确认就开打，不等打洞）
+   2) 背景继续 WebRTC 打洞（PeerJS 主信令 / MQTT 备用信令），打通即无缝升级直连
+   3) 中继期间有心跳，对方真正断开 12 秒内检测到；房主慢速重发 offer 持续尝试打洞 */
 'use strict';
 
 const Net = (function () {
@@ -16,6 +16,7 @@ const Net = (function () {
   let p2pTimer = null;      // P2P 等待超时 → 降级中继
   let hbTimer = null;       // 中继模式心跳
   let lastHb = 0;
+  let lastPunch = 0;        // 中继模式下背景打洞的节流
   let relayWanted = false;
   let pendingData = [];     // 连接建立前收到的消息，先缓存
   const handlers = {};
@@ -151,7 +152,6 @@ const Net = (function () {
     settled = true;
     conn = makeRelayWrap();
     clearP2pTimer();
-    stopSigPublishing();
     startHb();
     emit('connected', { role: role, peer: 'relay', relay: true });
     flush();
@@ -185,6 +185,13 @@ const Net = (function () {
       if (busReady()) {
         try { mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'hb' })); } catch (e) {}
       }
+      // 背景慢慢打洞：中继模式下房主周期性重发 offer，打通即自动升级直连
+      if (autoRole === 'host' && !hostHealthy() && mqttSig && mqttSig.ensureOffer &&
+          Date.now() - lastPunch >= 15000) {
+        lastPunch = Date.now();
+        tr('bg-punch');
+        mqttSig.ensureOffer();
+      }
       if (Date.now() - lastHb > HB_MAX) { clearHb(); emit('closed'); }
     }, HB_INT);
   }
@@ -196,8 +203,17 @@ const Net = (function () {
   function watchIce(pc) {
     if (!pc || !pc.addEventListener) return;
     pc.addEventListener('iceconnectionstatechange', function () {
-      tr('ice=' + pc.iceConnectionState);
-      if (pc.iceConnectionState !== 'failed' || settled) return;
+      const s = pc.iceConnectionState;
+      tr('ice=' + s);
+      // 打洞失败/掉线：已在中继就慢慢重试，不在中继才降级
+      if (s === 'failed' || s === 'disconnected') {
+        if (settled && conn && conn._relay && autoRole === 'host' &&
+            mqttSig && mqttSig.ensureOffer) {
+          tr('punch-retry ' + s);
+          mqttSig.ensureOffer();
+        }
+      }
+      if (s !== 'failed' || settled) return;
       if (busReady()) relayConnect(autoRole || 'guest');
       else emit('conn-error', new Error('P2P 连接失败'));
     });
@@ -338,7 +354,8 @@ const Net = (function () {
       try { mq.publish(topic, JSON.stringify(obj)); } catch (e) {}
     };
     const publishOffer = function () {
-      if (st.offer && !st.done && !settled) pub({ k: 'o', sd: st.offer, sid: st.sid });
+      // 中继模式下也继续发布：供背景打洞的 offer/answer 交换用
+      if (st.offer && !st.done && (!settled || (conn && conn._relay))) pub({ k: 'o', sd: st.offer, sid: st.sid });
     };
 
     mq.onopen = function () {
@@ -401,7 +418,8 @@ const Net = (function () {
         // 客：先敲门（房主在兜底状态时靠它重新发 offer），应答后周期发布应答码
         pub({ k: 'j', sid: st.sid });
         st.timers.push(setInterval(function () {
-          if (st.done || settled) return;
+          // 中继模式下也继续发：背景打洞靠它触发房主重发 offer / 传应答码
+          if (st.done || (settled && !(conn && conn._relay))) return;
           if (st.answer) pub({ k: 'a', sd: st.answer, sid: st.sid });
           else pub({ k: 'j', sid: st.sid });
         }, 2500));
@@ -421,8 +439,18 @@ const Net = (function () {
       if (t !== topic) return;
       if (!m || m.sid === st.sid) return;
       if (m.k === 'j') {
-        // 客方敲门：房主处于中继/掉线兜底状态时立刻重新发 offer
-        if (role === 'host' && st.ensureOffer) { tr('knock'); st.ensureOffer(); }
+        // 客方敲门 = 总线已就位：房主立刻先中继连上（不等打洞），并回 'hi' 让客方也连上
+        if (role === 'host') {
+          // 房主在线就回 'hi'（含自己处于中继兜底时），让客方不必等周期 offer
+          if (!settled || (conn && conn._relay)) pub({ k: 'hi', sid: st.sid });
+          if (!settled) relayConnect('host');
+          if (st.ensureOffer) { tr('knock'); st.ensureOffer(); }
+        }
+        return;
+      }
+      if (m.k === 'hi') {
+        // 房主确认在线：客方立即走中继开打，打洞在背景继续
+        if (role === 'guest' && !settled) relayConnect('guest');
         return;
       }
       if (typeof m.sd !== 'string') return;
@@ -437,6 +465,8 @@ const Net = (function () {
             tr('accept-err ' + e);
           });
       } else if (role === 'guest' && m.k === 'o') {
+        // 先中继连上（'hi' 丢失时的兜底），打洞照常在背景走
+        if (!settled) relayConnect('guest');
         // 直连健康 → 不再理会 offer；同一份 offer 只应答一次；
         // 房主重发新 offer（对方刷新重进后的兜底重连）→ 重新应答
         if (settled && conn && conn.open && !conn._relay) { tr('offer-drop healthy'); return; }
