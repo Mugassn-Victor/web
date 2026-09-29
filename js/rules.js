@@ -295,6 +295,179 @@ const Rules = (function () {
 
   function cellName(r, c) { return (9 - c) + ',' + (9 - r); }
 
+  // ===== 绝杀棋型识别（sideToMove = 被将死方） =====
+  function matePattern(state, sideToMove) {
+    const st = status(state, sideToMove);
+    if (!st.over) return null;
+    if (st.reason === 'stalemate') return '困毙';
+    if (st.reason !== 'checkmate') return '绝杀';
+
+    const loser = sideToMove;
+    const winner = loser === RED ? BLACK : RED;
+    const k = findKing(state, loser);
+    if (!k) return '绝杀';
+    const kr = k[0], kc = k[1];
+    const dir = loser === BLACK ? 1 : -1;
+    const cornerRows = loser === BLACK ? [0, 2] : [7, 9];
+    const backRow = loser === BLACK ? 0 : 9;
+    const pawnRow = loser === BLACK ? 3 : 6;
+    const fishRow = loser === BLACK ? 2 : 7;
+
+    function attacksKing(p, r, c) {
+      const ms = pseudoMoves(state, r, c, p);
+      for (let i = 0; i < ms.length; i++) {
+        if (ms[i][0] === kr && ms[i][1] === kc) return true;
+      }
+      return false;
+    }
+
+    // 攻方照将子清单（含将帅照面）
+    const checkers = [];
+    for (let r = 0; r < 10; r++) {
+      for (let c = 0; c < 9; c++) {
+        const p = state[r][c];
+        if (p && p.side === winner && attacksKing(p, r, c)) checkers.push({ p: p, r: r, c: c });
+      }
+    }
+    const facing = kingsFacing(state);
+    if (checkers.length + (facing ? 1 : 0) >= 2) return '双将';
+    if (facing) return '对面笑';
+    if (!checkers.length) return '绝杀';
+    const ch = checkers[0];
+    const type = ch.p.type;
+
+    // 马是否参与（将军或控制将门）
+    function nInRole(r, c) {
+      const p = state[r][c];
+      if (attacksKing(p, r, c)) return true;
+      const d = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+      const ms = pseudoMoves(state, r, c, p);
+      for (let i = 0; i < 4; i++) {
+        const qr = kr + d[i][0], qc = kc + d[i][1];
+        if (!inPalace(loser, qr, qc)) continue;
+        for (let j = 0; j < ms.length; j++) {
+          if (ms[j][0] === qr && ms[j][1] === qc) return true;
+        }
+      }
+      return false;
+    }
+    function anyOwnN(cond) {
+      for (let r = 0; r < 10; r++) {
+        for (let c = 0; c < 9; c++) {
+          const p = state[r][c];
+          if (p && p.side === winner && p.type === 'N' && cond(r, c)) return true;
+        }
+      }
+      return false;
+    }
+
+    // 炮型：按唯一炮架性质区分
+    if (type === 'C') {
+      const dr = Math.sign(kr - ch.r), dc = Math.sign(kc - ch.c);
+      if (dr === 0 || dc === 0) {
+        let screen = null, cnt = 0;
+        let r = ch.r + dr, c = ch.c + dc;
+        while (r !== kr || c !== kc) {
+          const p = state[r][c];
+          if (p) { screen = p; cnt++; }
+          r += dr; c += dc;
+        }
+        if (cnt === 1 && screen) {
+          if (screen.side === winner && screen.type === 'N') return '马后炮';
+          if (screen.side === winner && screen.type === 'C') return '重炮';
+          if (screen.side === loser) return '闷宫';
+        }
+      }
+    }
+
+    // 铁门栓：车/兵贴身封锁将门 + 中线炮或借帅力
+    if ((type === 'R' || type === 'P') && Math.abs(kr - ch.r) + Math.abs(kc - ch.c) === 1) {
+      let cannon = false;
+      for (let r = 0; r < 10; r++) {
+        const p = state[r][kc];
+        if (p && p.side === winner && p.type === 'C') { cannon = true; break; }
+      }
+      let kingPower = false;
+      const wk = findKing(state, winner);
+      if (wk && wk[1] === ch.c) {
+        const lo = Math.min(wk[0], ch.r), hi = Math.max(wk[0], ch.r);
+        kingPower = true;
+        for (let r = lo + 1; r < hi; r++) {
+          if (state[r][ch.c]) { kingPower = false; break; }
+        }
+      }
+      if (cannon || kingPower) return '铁门栓';
+    }
+
+    // 双车错：另一车控将门纵横线
+    if (type === 'R') {
+      for (let r = 0; r < 10; r++) {
+        for (let c = 0; c < 9; c++) {
+          const p = state[r][c];
+          if (p && p !== ch.p && p.side === winner && p.type === 'R' && (r === kr || c === kc)) return '双车错';
+        }
+      }
+    }
+
+    // 马位配合类
+    if (anyOwnN(function (r, c) {
+      return cornerRows.indexOf(r) >= 0 && (c === 3 || c === 5) &&
+        (attacksKing(state[r][c], r, c) ||
+          (Math.abs(r - kr) === 2 && Math.abs(c - kc) === 2 && nInRole(r, c)));
+    })) return '八角马';
+    if (anyOwnN(function (r, c) {
+      return r === kr + dir && Math.abs(c - kc) === 2 && attacksKing(state[r][c], r, c);
+    })) return '卧槽马';
+    if (anyOwnN(function (r, c) {
+      return r === pawnRow && (c === 2 || c === 6) && nInRole(r, c);
+    })) return '侧面虎';
+    if (type === 'R' && anyOwnN(function (r, c) {
+      return Math.abs(r - kr) === 2 && Math.abs(c - kc) === 2 && nInRole(r, c);
+    })) return '列马车';
+    if (anyOwnN(function (r, c) {
+      return r === fishRow && (c === 2 || c === 6) && nInRole(r, c);
+    })) return '钓鱼马';
+
+    // 双炮配合类
+    const cannons = [];
+    let hasR = false;
+    for (let r = 0; r < 10; r++) {
+      for (let c = 0; c < 9; c++) {
+        const p = state[r][c];
+        if (p && p.side === winner && p.type === 'C') cannons.push({ r: r, c: c });
+        if (p && p.side === winner && p.type === 'R') hasR = true;
+      }
+    }
+    if (cannons.length >= 2) {
+      let aligned = false;
+      for (let i = 0; i < cannons.length && !aligned; i++) {
+        for (let j = i + 1; j < cannons.length; j++) {
+          if (cannons[i].r === cannons[j].r || cannons[i].c === cannons[j].c) { aligned = true; break; }
+        }
+      }
+      if (aligned && hasR) return '夹车炮';
+      let bottom = false, onFile = false;
+      for (let i = 0; i < cannons.length; i++) {
+        if (cannons[i].r === backRow) bottom = true;
+        if (cannons[i].c === kc) onFile = true;
+      }
+      if (bottom && onFile) return '天地炮';
+    }
+
+    // 闷杀：将的退路被己方棋子堵死
+    const d4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    let blockedOwn = 0;
+    for (let i = 0; i < d4.length; i++) {
+      const qr = kr + d4[i][0], qc = kc + d4[i][1];
+      if (!inPalace(loser, qr, qc)) continue;
+      const p = state[qr][qc];
+      if (p && p.side === loser) blockedOwn++;
+    }
+    if (blockedOwn >= 3) return '闷杀';
+
+    return '绝杀';
+  }
+
   return {
     RED: RED,
     BLACK: BLACK,
@@ -312,7 +485,8 @@ const Rules = (function () {
     status: status,
     derive: derive,
     moveText: moveText,
-    cellName: cellName
+    cellName: cellName,
+    matePattern: matePattern
   };
 })();
 

@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>running</title></head>
+<body>
+<pre id="out">running…</pre>
+<div style="display:flex;gap:10px">
+  <iframe id="fa" style="width:980px;height:830px;border:0"></iframe>
+  <iframe id="fb" style="width:980px;height:830px;border:0"></iframe>
+</div>
+<script>
+const PAGE = new URLSearchParams(location.search).get('p') || 'xqtest.html';
+document.getElementById('fa').src = PAGE;
+document.getElementById('fb').src = PAGE;
+
+const out = [];
+let pass = 0, fail = 0;
+function check(name, cond, extra) {
+  if (cond) { pass++; out.push('PASS ' + name); }
+  else { fail++; out.push('FAIL ' + name + (extra !== undefined ? ' [' + extra + ']' : '')); }
+  document.getElementById('out').textContent = 'RESULT pass=' + pass + ' fail=' + fail + '\n' + out.join('\n');
+}
+function finish() {
+  document.getElementById('out').textContent = 'RESULT pass=' + pass + ' fail=' + fail + '\n' + out.join('\n');
+  document.title = 'DONE pass=' + pass + ' fail=' + fail;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 后台页面 setTimeout(25) 会被 Chromium 节流到 1s，用 MessageChannel 做全速让步
+function tick() {
+  return new Promise(r => {
+    const c = new MessageChannel();
+    c.port1.onmessage = function () { r(); };
+    c.port2.postMessage(0);
+  });
+}
+function log(msg) {
+  out.push('> [t=' + Math.round(performance.now() / 1000) + 's tick=' + (window.__ticks || 0) + '] ' + msg);
+  document.getElementById('out').textContent = 'RESULT pass=' + pass + ' fail=' + fail + '\n' + out.join('\n');
+}
+async function until(fn, triesOrMs) {
+  // 第二参数兼容旧用法（次数），内部按毫秒超时（tick 全速轮询）
+  const budget = (triesOrMs || 500) > 1000 ? triesOrMs : (triesOrMs || 500) * 25;
+  const end = performance.now() + budget;
+  let n = 0;
+  while (performance.now() < end) {
+    if (fn()) return true;
+    // 定期让出真实定时器：纯 MessageChannel 自旋会饿死 CDP/WebSocket 任务
+    if ((++n & 255) === 0) await sleep(15); else await tick();
+  }
+  return false;
+}
+const FRAME_IDS = ['fa', 'fb'];
+function D(i) { const f = document.getElementById(FRAME_IDS[i]); return f && f.contentDocument; }
+function W(i) { const f = document.getElementById(FRAME_IDS[i]); return f && f.contentWindow; }
+function g(i, id) { const d = D(i); return d && d.getElementById(id); }
+function txt(i, id) { const el = g(i, id); return el ? el.textContent : ''; }
+function click(i, id) { const el = g(i, id); if (el) el.click(); }
+function hidden(i, id) { const el = g(i, id); return !el || el.classList.contains('hidden'); }
+function gameVisible(i) { return !hidden(i, 'game'); }
+function lobbyVisible(i) { return !hidden(i, 'lobby'); }
+function hist(i) { const w = W(i); return (w && w.App && Array.isArray(w.App.history)) ? w.App.history : null; }
+function histLen(i) { const h = hist(i); return h ? h.length : -1; }
+function eqMv(h, i, from, to) {
+  const m = h && h[i];
+  return !!m && m.from[0] === from[0] && m.from[1] === from[1] && m.to[0] === to[0] && m.to[1] === to[1];
+}
+function disconnected(i) { const w = W(i); return !!(w && w.App && w.App.disconnected); }
+function selCount(i) { return g(i, 'pieces').querySelectorAll('.piece.sel').length; }
+function dotCount(i) { return g(i, 'marks').querySelectorAll('.dot').length; }
+function lastCount(i) { return g(i, 'marks').querySelectorAll('.last').length; }
+function pieceCount(i) { return g(i, 'pieces').childElementCount; }
+function modalBtn(i, label) {
+  const d = D(i); if (!d) return null;
+  const bs = Array.from(d.querySelectorAll('#modalBtns .btn'));
+  return bs.find(b => b.textContent === label) || null;
+}
+function modalVisible(i) { return !hidden(i, 'overlay'); }
+function side(i) { return txt(i, 'sideTag').indexOf('红方') === 0 ? 'r' : 'b'; }
+function cellClick(i, r, c) {
+  const board = g(i, 'board');
+  if (!board) return;
+  const rect = board.getBoundingClientRect();
+  const ori = side(i);
+  const x = ori === 'r' ? (c + 1) : (8 - c + 1);
+  const y = ori === 'r' ? (r + 1) : (9 - r + 1);
+  const win = W(i);
+  const ev = new win.MouseEvent('click', {
+    clientX: rect.left + x / 10 * rect.width,
+    clientY: rect.top + y / 11 * rect.height,
+    bubbles: true, cancelable: true, view: win
+  });
+  board.dispatchEvent(ev);
+}
+function reloadFrame(i) {
+  const f = document.getElementById(FRAME_IDS[i]);
+  // 用 reload 保留 hash（直接赋同 URL 只会做 fragment 导航，不重载）
+  try { f.contentWindow.location.reload(); }
+  catch (e) { f.src = PAGE; }
+}
+async function waitReady(i) {
+  return await until(() => {
+    const b = g(i, 'btnCreate');
+    return !!(b && typeof b.onclick === 'function') && lobbyVisible(i);
+  }, 800);
+}
+async function waitSync(n, tries) {
+  const ok = await until(() => histLen(0) === n && histLen(1) === n, tries || 300);
+  return ok;
+}
+async function waitRejoined(i, n) {
+  const end = performance.now() + 60000;
+  let lastLog = 0;
+  let wrSpin = 0;
+  while (performance.now() < end) {
+    if (performance.now() - lastLog > 4000) {
+      lastLog = performance.now();
+      try {
+        const w1 = W(1);
+        const w0 = W(0);
+        log('waitRejoined vis=' + gameVisible(i) +
+          ' h=' + histLen(i) + ' disc=' + disconnected(i) +
+          ' m1=' + modalVisible(i) + ' m2=' + modalVisible(1 - i) +
+          ' | B.phase=' + (w1 && w1.App && w1.App.phase) +
+          ' B.status=' + txt(1, 'lobbyStatus').slice(0, 40) +
+          ' | A.phase=' + (w0 && w0.App && w0.App.phase) +
+          ' A.mode=' + (w0 && w0.App && w0.App.mode) +
+          ' A.host=' + (g(0, 'roomCode') && g(0, 'roomCode').textContent) +
+          ' A.lobby=' + txt(0, 'lobbyStatus').slice(0, 40) +
+          ' A.modalTitle=' + txt(0, 'modalTitle'));
+      } catch (e) { log('waitRejoined EX ' + String(e)); }
+    }
+    try {
+      if (gameVisible(i) && histLen(i) === n && !disconnected(i) &&
+        !modalVisible(i) && !modalVisible(1 - i)) return true;
+    } catch (e) { log('waitRejoined fn EX ' + String(e)); return false; }
+    if ((wrSpin++ & 255) === 0) await sleep(15); else await tick();
+  }
+  return false;
+}
+
+  async function run() {
+  // 心跳：证明事件循环是否存活
+  let ticks = 0;
+  const hb = setInterval(function () {
+    ticks++;
+    window.__ticks = ticks;
+    if (ticks % 10 === 0) log('心跳 ticks=' + ticks);
+  }, 1000);
+  // 信令诊断：每秒把两个 iframe 的 Net._trace 抓到顶层（供 CDP PROBE 读取）
+  setInterval(function () {
+    try {
+      const a = document.getElementById('fa').contentWindow;
+      window.__tA = a.eval("JSON.stringify(typeof Net!=='undefined'?Net._trace.slice(-70):'noNet')");
+    } catch (e) { window.__tA = 'ex:' + e; }
+    try {
+      const b = document.getElementById('fb').contentWindow;
+      window.__tB = b.eval("JSON.stringify(typeof Net!=='undefined'?Net._trace.slice(-70):'noNet')");
+    } catch (e) { window.__tB = 'ex:' + e; }
+  }, 1000);
+  // ===== 0. 双端就绪 =====
+  const bothReady = await until(() => {
+    const a = g(0, 'btnCreate'), b = g(1, 'btnCreate');
+    return !!(a && typeof a.onclick === 'function') && !!(b && typeof b.onclick === 'function');
+  }, 800);
+  check('双端脚本就绪', bothReady);
+  if (!bothReady) { finish(); return; }
+
+  // ===== 1. 创建 / 加入 =====
+  click(0, 'btnCreate');
+  check('房主面板立即显示', !hidden(0, 'hostPanel'));
+  const gotCode = await until(() => {
+    const t = txt(0, 'roomCode');
+    return t && t !== '------' && t.length === 6;
+  }, 800);
+  check('房主获得6位房间号', gotCode, txt(0, 'roomCode'));
+  const code = txt(0, 'roomCode');
+  check('房间号为纯数字', /^\d{6}$/.test(code), code);
+
+  const hasInput = await until(() => g(1, 'roomInput'), 800);
+  check('加入方界面就绪', hasInput);
+  if (!hasInput) { finish(); return; }
+  g(1, 'roomInput').value = code;
+  click(1, 'btnJoin');
+  const cd = txt(1, 'lobbyStatus');
+  check('加入时显示倒计时', cd.indexOf('剩余') >= 0, cd);
+
+    // 中继兜底路径（relayonly 页）最坏要等 gather 8s×2 + P2P 超时 10s 才降级，预算放宽
+    const bothIn = await until(() => gameVisible(0) && gameVisible(1), 60000);
+  check('双方进入对局界面', bothIn);
+  if (bothIn) {
+    check('房主执红先手', side(0) === 'r', txt(0, 'sideTag'));
+    check('加入方执黑后手', side(1) === 'b', txt(1, 'sideTag'));
+    check('棋盘渲染32子(A)', pieceCount(0) === 32, pieceCount(0));
+    check('棋盘渲染32子(B)', pieceCount(1) === 32, pieceCount(1));
+    check('红方轮次提示', txt(0, 'turnTag').indexOf('红方走棋（你）') === 0, txt(0, 'turnTag'));
+
+    // ===== 2. 选中与落点提示（应无任何落点标记） =====
+    cellClick(0, 7, 7);
+    check('选中棋子有高亮', selCount(0) === 1, selCount(0));
+    check('不显示落点标记', dotCount(0) === 0, dotCount(0));
+
+    // 红方炮二平五 (7,7)->(7,4)
+    cellClick(0, 7, 4);
+    const a1 = await waitSync(1);
+    check('红方走法记录(A)', a1 && eqMv(hist(0), 0, [7, 7], [7, 4]),
+      a1 ? JSON.stringify(hist(0)[0]) : 'timeout');
+    check('黑方同步收到走法', eqMv(hist(1), 0, [7, 7], [7, 4]), JSON.stringify(hist(1) && hist(1)[0]));
+    check('轮到黑方(B提示)', txt(1, 'turnTag').indexOf('黑方走棋（你）') === 0, txt(1, 'turnTag'));
+    check('A上一步标记', lastCount(0) === 2, lastCount(0));
+
+    // 黑方马2进3 (0,1)->(2,2)
+    cellClick(1, 0, 1);
+    cellClick(1, 2, 2);
+    const b1 = await waitSync(2);
+    check('黑方走马记录(B)', b1 && eqMv(hist(1), 1, [0, 1], [2, 2]),
+      b1 ? JSON.stringify(hist(1)[1]) : 'timeout');
+    check('红方同步收到黑方走法', eqMv(hist(0), 1, [0, 1], [2, 2]), JSON.stringify(hist(0) && hist(0)[1]));
+    check('轮回红方', txt(0, 'turnTag').indexOf('红方走棋（你）') === 0, txt(0, 'turnTag'));
+
+    // ===== 3. 非法落点 =====
+    cellClick(0, 9, 0);
+    check('车选中高亮', selCount(0) === 1, selCount(0));
+    cellClick(0, 5, 0);
+    await sleep(150);
+    check('非法落点不产生走法', histLen(0) === 2 && histLen(1) === 2,
+      histLen(0) + '/' + histLen(1));
+
+    // ===== 4. 悔棋 =====
+    click(0, 'btnUndo');
+    const bModal = await until(() => modalVisible(1) && txt(1, 'modalTitle') === '悔棋请求');
+    check('黑方收到悔棋请求', bModal, txt(1, 'modalTitle'));
+    const agree = modalBtn(1, '同意');
+    if (agree) agree.click();
+    const undone = await waitSync(0);
+    check('悔棋后双方记录清空', undone, histLen(0) + '/' + histLen(1));
+    check('悔棋后回到红方', txt(0, 'turnTag').indexOf('红方走棋（你）') === 0, txt(0, 'turnTag'));
+
+    // ===== 5. 认输 =====
+    click(0, 'btnResign');
+    const resignModal = await until(() => modalVisible(0) && txt(0, 'modalTitle') === '认输');
+    check('A弹出认输确认', resignModal, txt(0, 'modalTitle'));
+    const yes = modalBtn(0, '确定认输');
+    if (yes) yes.click();
+    const aOver = await until(() => txt(0, 'modalTitle') === '失败');
+    const bOver = await until(() => txt(1, 'modalTitle') === '胜利');
+    check('A判定失败', aOver, txt(0, 'modalTitle'));
+    check('B判定胜利', bOver, txt(1, 'modalTitle'));
+
+    // ===== 6. 重开 =====
+    const ask = modalBtn(0, '再来一局');
+    if (ask) ask.click();
+    const bAsk = await until(() => modalVisible(1) && txt(1, 'modalTitle') === '再来一局');
+    check('B收到重开请求', bAsk, txt(1, 'modalTitle'));
+    const ok = modalBtn(1, '同意');
+    if (ok) ok.click();
+    const restarted = await until(() =>
+      histLen(0) === 0 && histLen(1) === 0 &&
+      !modalVisible(0) && !modalVisible(1) &&
+      txt(0, 'turnTag').indexOf('红方走棋') === 0, 400);
+    check('双方重新开局', restarted,
+      'h0=' + histLen(0) + ' h1=' + histLen(1) + ' turn=' + txt(0, 'turnTag'));
+    check('重开后A仍为红方', side(0) === 'r', txt(0, 'sideTag'));
+    check('重开后棋子复位', pieceCount(0) === 32 && pieceCount(1) === 32,
+      pieceCount(0) + '/' + pieceCount(1));
+    check('无断线横幅', hidden(0, 'banner'));
+
+    // ===== 7. 已删除的面板 =====
+    check('棋谱面板已删除', !g(0, 'moveLog') && !g(1, 'moveLog'));
+    check('被吃棋子面板已删除', !g(0, 'capMine') && !g(1, 'capMine'));
+
+    // ===== 8. 客方退出重开页面后输号重新加入 =====
+    cellClick(0, 7, 7); cellClick(0, 7, 4);           // 红 炮二平五
+    await waitSync(1);
+    cellClick(1, 0, 1); cellClick(1, 2, 2);           // 黑 马2进3
+    await waitSync(2);
+    reloadFrame(1);
+    log('step8: 已刷新客方，等待就绪');
+    const r1 = await waitReady(1);
+    check('客方页面重新加载', r1);
+    if (r1) {
+      g(1, 'roomInput').value = code;
+      log('step8: 客方点击加入');
+      click(1, 'btnJoin');
+      log('step8: click 返回');
+      const rejoined = await waitRejoined(1, 2);
+      log('step8: waitRejoined=' + rejoined + ' vis=' + gameVisible(1) +
+        ' h1=' + histLen(1) + ' disc=' + disconnected(1) +
+        ' modal1=' + modalVisible(1) + ' modal0=' + modalVisible(0) +
+        ' lobbyStatus=' + txt(1, 'lobbyStatus'));
+      check('客方重新输号加入成功', rejoined, 'hist=' + histLen(1) + ' vis=' + gameVisible(1));
+      check('客方棋谱恢复', histLen(1) === 2 && eqMv(hist(1), 0, [7, 7], [7, 4]) &&
+        eqMv(hist(1), 1, [0, 1], [2, 2]), JSON.stringify(hist(1)));
+      check('房主侧棋局保持', histLen(0) === 2, histLen(0));
+      check('房主侧掉线弹窗清除', !modalVisible(0) && !disconnected(0),
+        'modal=' + modalVisible(0) + ' disc=' + disconnected(0));
+      // 继续走子：红 (7,4)->(7,3)
+      cellClick(0, 7, 4); cellClick(0, 7, 3);
+      const c1 = await waitSync(3);
+      check('重连后可继续走子', c1 && eqMv(hist(0), 2, [7, 4], [7, 3]),
+        c1 ? JSON.stringify(hist(0)[2]) : 'timeout');
+    }
+
+    // ===== 9. 房主退出重开页面后输号接管（静默身份记忆） =====
+    reloadFrame(0);
+    const r2 = await waitReady(0);
+    check('房主页面重新加载', r2);
+    if (r2) {
+      g(0, 'roomInput').value = code;
+      click(0, 'btnJoin');
+      const taken = await waitRejoined(0, 3);
+      check('房主重新输号接管房间', taken, 'hist=' + histLen(0) + ' vis=' + gameVisible(0) +
+        ' room=' + txt(0, 'roomTag'));
+      check('房主棋谱恢复', histLen(0) === 3 && eqMv(hist(0), 2, [7, 4], [7, 3]),
+        JSON.stringify(hist(0)));
+      check('房主仍执红方', side(0) === 'r', txt(0, 'sideTag'));
+      check('对手侧仍在进行', histLen(1) === 3 && !disconnected(1) && !modalVisible(1),
+        'hist=' + histLen(1) + ' disc=' + disconnected(1));
+      // 继续走子：此时轮到黑方 → B 马 (2,2)->(1,4)
+      cellClick(1, 2, 2);
+      cellClick(1, 1, 4);
+      const c2 = await waitSync(4);
+      check('房主重进后继续走子', c2 && eqMv(hist(1), 3, [2, 2], [1, 4]),
+        c2 ? JSON.stringify(hist(1)[3]) : 'timeout');
+    }
+
+    // ===== 10. 无人房间输号 → 自动用该号建房 =====
+    click(1, 'btnLeave');                           // 客方退出（弹确认框）
+    const lv1 = await until(() => modalVisible(1) && txt(1, 'modalTitle') === '退出', 800);
+    const lvb1 = modalBtn(1, '退出');
+    if (lvb1) lvb1.click();
+    const l1 = await waitReady(1);
+    check('客方退回大厅', l1, lobbyVisible(1));
+    if (l1) {
+      g(1, 'roomInput').value = '998877';
+      click(1, 'btnJoin');
+      // 无主房间：坏信令下要等 45 秒倒计时才自动用该号建房（后台 iframe 计时被节流，预算放宽到 90s）
+      const hosted = await until(() => txt(1, 'roomCode') === '998877' && !hidden(1, 'hostPanel'), 150000);
+      check('无人房间自动用该号建房', hosted, txt(1, 'roomCode'));
+      const st = txt(1, 'lobbyStatus');
+      check('自动建房提示语', st.indexOf('无人应答') >= 0, st);
+
+      click(0, 'btnLeave');                        // 原房主也退出（弹确认框）
+      await until(() => modalVisible(0) && txt(0, 'modalTitle') === '退出', 800);
+      const lvb0 = modalBtn(0, '退出');
+      if (lvb0) lvb0.click();
+      const l2 = await waitReady(0);
+      check('原房主退回大厅', l2, lobbyVisible(0));
+      if (l2) {
+        g(0, 'roomInput').value = '998877';
+        click(0, 'btnJoin');
+        const bothNew = await until(() => gameVisible(0) && gameVisible(1), 45000);
+        log('step10 bothNew=' + bothNew +
+          ' A.phase=' + (W(0).App && W(0).App.phase) + ' A.lobby=' + txt(0, 'lobbyStatus').slice(0, 40) + ' A.conn=' + txt(0, 'connTag') +
+          ' B.phase=' + (W(1).App && W(1).App.phase) + ' B.host=' + txt(1, 'roomCode') + ' B.conn=' + txt(1, 'connTag') + ' B.lobby=' + txt(1, 'lobbyStatus').slice(0, 30));
+        check('对手输号加入新房间', bothNew);
+        check('新客方(原房主)执黑', bothNew && side(0) === 'b', txt(0, 'sideTag'));
+        check('新房主(原客方)执红', bothNew && side(1) === 'r', txt(1, 'sideTag'));
+        check('新房间棋盘就绪', bothNew && pieceCount(0) === 32 && pieceCount(1) === 32,
+          pieceCount(0) + '/' + pieceCount(1));
+      }
+    }
+
+    // ===== 11. 绝杀特效可视化（截图用） =====
+    try {
+      W(0).eval('UI.fxFinish("绝 杀")');
+      await sleep(350);
+      check('绝杀特效元素出现', !!D(0).querySelector('.check-fx.finish'));
+    } catch (e) {
+      check('绝杀特效元素出现', false, String(e));
+    }
+  }
+
+  finish();
+}
+
+run().catch(e => {
+  out.push('EXCEPTION ' + (e && e.stack ? e.stack : e));
+  finish();
+});
+</script>
+</body></html>

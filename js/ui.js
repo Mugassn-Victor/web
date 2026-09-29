@@ -212,6 +212,17 @@ const UI = (function () {
     setTimeout(function () { d.remove(); board.classList.remove('flash'); }, 1000);
   }
 
+  // 绝杀特效：金色大字（3字以上棋型缩小字号防换行）
+  function fxFinish(text) {
+    const d = document.createElement('div');
+    const chars = text.replace(/\s/g, '').length;
+    d.className = 'check-fx finish' + (chars > 2 ? ' long' : '');
+    d.innerHTML = '<span>' + text + '</span>';
+    board.appendChild(d);
+    board.classList.add('flash');
+    setTimeout(function () { d.remove(); board.classList.remove('flash'); }, 1600);
+  }
+
   function mark(cls, r, c) {
     const el = document.createElement('div');
     el.className = 'mark ' + cls;
@@ -227,10 +238,6 @@ const UI = (function () {
     }
     if (opts.sel) {
       mark('square', opts.sel[0], opts.sel[1]);
-      (opts.targets || []).forEach(function (t) {
-        const occupied = !!state[t[0]][t[1]];
-        mark(occupied ? 'dot capture' : 'dot', t[0], t[1]);
-      });
     }
   }
 
@@ -247,6 +254,7 @@ const UI = (function () {
     render: render,
     clear: clear,
     fxCheck: fxCheck,
+    fxFinish: fxFinish,
     sound: sound
   };
 })();

@@ -24,12 +24,22 @@ const Net = (function () {
   const HB_INT = 3000;      // 心跳间隔
   const HB_MAX = 12000;     // 超过这个时间没收到任何消息 → 对方已断
 
+  const _trace = [];
+  function tr(evt) {
+    _trace.push(String(Date.now() % 100000000) + ' ' + evt);
+    if (_trace.length > 300) _trace.shift();
+  }
+
   function on(evt, fn) { handlers[evt] = fn; }
   function emit(evt, data) { if (handlers[evt]) handlers[evt](data); }
 
   function isWrappedMpc(c) { return !!(mpc && c && c._pc === mpc); }
   function busReady() {
     return !!(mqttSig && mqttSig.mq && !mqttSig.done && mqttSig.mq._opened);
+  }
+  // 房主当前传输是否为健康直连（中继兜底/掉线状态都需要重新发 offer 等对方接回）
+  function hostHealthy() {
+    return !!(settled && conn && conn.open && !conn._relay);
   }
 
   function deliver(d) {
@@ -55,6 +65,7 @@ const Net = (function () {
         conn = c;
         clearP2pTimer();
         stopSignaling();
+        tr('fire-upgrade role=' + role);
         emit('reconnected', { role: role, peer: (c && c.peer) || 'p2p', upgraded: lateP2P });
         flush();
         return;
@@ -66,6 +77,7 @@ const Net = (function () {
     conn = c;
     clearP2pTimer();
     stopSignaling();
+    tr('fire-first role=' + role + ' relay=' + !!(c && c._relay));
     emit('connected', { role: role, peer: (c && c.peer) || 'p2p' });
     flush();
   }
@@ -87,6 +99,7 @@ const Net = (function () {
     c.on('data', function (d) { if (c === conn) deliver(d); });
     c.on('close', function () {
       if (dead) return;
+      tr('conn-close settled=' + settled + ' relay=' + !!(conn && conn._relay) + ' same=' + (c === conn));
       if (settled) {
         if (c !== conn || conn._relay) return;
         if (busReady()) { conn = makeRelayWrap(); startHb(); emit('relay'); }
@@ -117,7 +130,8 @@ const Net = (function () {
   function startP2pTimer(role) {
     if (role) autoRole = role;
     if (p2pTimer || settled) return;
-    p2pTimer = setTimeout(function () { p2pTimer = null; tryRelay(); }, P2P_WAIT);
+    tr('p2p-timer-start');
+    p2pTimer = setTimeout(function () { p2pTimer = null; tr('p2p-timeout'); tryRelay(); }, P2P_WAIT);
   }
 
   function clearP2pTimer() {
@@ -126,12 +140,14 @@ const Net = (function () {
 
   function tryRelay() {
     if (settled) return;
-    if (!busReady()) { relayWanted = true; return; }
+    if (!busReady()) { relayWanted = true; tr('tryRelay-busnotready'); return; }
+    tr('tryRelay-fire');
     relayConnect(autoRole || 'guest');
   }
 
   function relayConnect(role) {
     if (settled || !busReady()) return;
+    tr('relayConnect role=' + role);
     settled = true;
     conn = makeRelayWrap();
     clearP2pTimer();
@@ -153,11 +169,12 @@ const Net = (function () {
   }
 
   function busSend(o) {
-    if (!busReady()) return false;
+    if (!busReady()) { tr('send-skip nobus ' + (o && o.t)); return false; }
     try {
+      tr('send ' + (o && o.t));
       mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'm', d: o }));
       return true;
-    } catch (e) { return false; }
+    } catch (e) { tr('send-err ' + e); return false; }
   }
 
   function startHb() {
@@ -179,6 +196,7 @@ const Net = (function () {
   function watchIce(pc) {
     if (!pc || !pc.addEventListener) return;
     pc.addEventListener('iceconnectionstatechange', function () {
+      tr('ice=' + pc.iceConnectionState);
       if (pc.iceConnectionState !== 'failed' || settled) return;
       if (busReady()) relayConnect(autoRole || 'guest');
       else emit('conn-error', new Error('P2P 连接失败'));
@@ -260,8 +278,11 @@ const Net = (function () {
   // （房主掉线重进时以同一房间号重新注册 Peer，等待中的客方重拨即可接上）
   function resume() {
     if (dead || !lastRoom) return;
+    tr('resume role=' + autoRole);
     if (!(mqttSig && !mqttSig.done && mqttSig.mq && mqttSig.mq._opened)) {
       startMqttSig(lastRoom, autoRole || 'guest');
+    } else if (autoRole === 'host' && mqttSig.ensureOffer) {
+      mqttSig.ensureOffer();
     }
     if (autoRole === 'guest' && peer && lastRoom) {
       try {
@@ -306,7 +327,8 @@ const Net = (function () {
     const sid = Math.random().toString(36).slice(2, 10);
     const st = {
       mq: null, topic: topic, sid: sid, timers: [],
-      offer: null, answer: null, answering: false, accepted: false, done: false
+      offer: null, answer: null, answering: false, accepted: false, done: false,
+      lastOffer: null, lastEnsure: 0, ensuring: false, offerTimer: null, ensureOffer: null
     };
     mqttSig = st;
 
@@ -321,21 +343,67 @@ const Net = (function () {
 
     mq.onopen = function () {
       if (st.done) return;
+      tr('mq-open role=' + role);
       mq.subscribe(topic);
       mq.subscribe(dataTopic);
       if (relayWanted && !settled) { relayWanted = false; relayConnect(autoRole || 'guest'); return; }
-      if (settled) return;
+      if (settled) {
+        // 总线重建后房主仍处于中继/掉线兜底状态 → 补发 offer 等对方接回
+        if (role === 'host' && st.ensureOffer) st.ensureOffer();
+        return;
+      }
       if (role === 'host') {
         // 主：生成连接码，周期发布，等对方应答
+        st.ensuring = true;
         manualOffer().then(function (code) {
+          st.ensuring = false;
+          if (st.done || mqttSig !== st) return;
           st.offer = code;
           publishOffer();
-        }).catch(function () {});
+        }).catch(function () { st.ensuring = false; });
         st.timers.push(setInterval(publishOffer, 2500));
+
+        // 兜底重连：对方刷新页面后重进会先「敲门」，此时房主若在中继/掉线状态
+        // （对方早已收不到周期 offer），要重新生成 offer、放开应答闸，让对方接回
+        st.ensureOffer = function () {
+          if (st.done || dead) { tr('ensure-skip done'); return; }
+          if (!st.mq || !st.mq._opened) { tr('ensure-skip nobus'); return; }
+          if (hostHealthy()) { tr('ensure-skip healthy'); return; }
+          if (!settled && (st.offer || st.ensuring)) { tr('ensure-skip inflight'); return; }
+          // 'new' 不拦截：TURN 全挂的环境里旧 offer 的 pc 会永远停在 new，
+          // 拦了就会让客方敲门永远得不到新 offer（中继兜底模式下无法重连）
+          if (mpc && ['checking', 'connected', 'completed'].indexOf(mpc.iceConnectionState) >= 0) {
+            tr('ensure-skip mpc=' + mpc.iceConnectionState); return;
+          }
+          const now = Date.now();
+          if (st.ensuring || now - st.lastEnsure < 6000) { tr('ensure-skip throttle'); return; }
+          tr('ensure-run');
+          st.lastEnsure = now;
+          st.ensuring = true;
+          manualOffer().then(function (code) {
+            st.ensuring = false;
+            if (st.done || dead || mqttSig !== st) return;
+            st.offer = code;
+            st.accepted = false;                           // 放开应答闸：接受新一轮 answer
+            pub({ k: 'o', sd: code, sid: st.sid });
+            if (!st.offerTimer) {
+              st.offerTimer = setInterval(function () {
+                if (st.done || hostHealthy()) {
+                  clearInterval(st.offerTimer); st.offerTimer = null; return;
+                }
+                if (st.offer) pub({ k: 'o', sd: st.offer, sid: st.sid });
+              }, 2500);
+              st.timers.push(st.offerTimer);
+            }
+          }).catch(function () { st.ensuring = false; });
+        };
       } else {
-        // 客：应答码生成后周期发布（防止对方晚订阅漏收）
+        // 客：先敲门（房主在兜底状态时靠它重新发 offer），应答后周期发布应答码
+        pub({ k: 'j', sid: st.sid });
         st.timers.push(setInterval(function () {
-          if (st.answer && !st.done && !settled) pub({ k: 'a', sd: st.answer, sid: st.sid });
+          if (st.done || settled) return;
+          if (st.answer) pub({ k: 'a', sd: st.answer, sid: st.sid });
+          else pub({ k: 'j', sid: st.sid });
         }, 2500));
       }
     };
@@ -347,28 +415,49 @@ const Net = (function () {
       if (t === dataTopic) {
         // 消息中继通道：心跳 + 对局消息
         lastHb = Date.now();
-        if (m && m.k === 'm' && m.d !== undefined) deliver(m.d);
+        if (m && m.k === 'm' && m.d !== undefined) { tr('recv ' + (m.d && m.d.t)); deliver(m.d); }
         return;
       }
       if (t !== topic) return;
-      if (!m || m.sid === st.sid || typeof m.sd !== 'string') return;
+      if (!m || m.sid === st.sid) return;
+      if (m.k === 'j') {
+        // 客方敲门：房主处于中继/掉线兜底状态时立刻重新发 offer
+        if (role === 'host' && st.ensureOffer) { tr('knock'); st.ensureOffer(); }
+        return;
+      }
+      if (typeof m.sd !== 'string') return;
       if (role === 'host' && m.k === 'a' && !st.accepted) {
+        tr('ans-recv');
         st.accepted = true;
-        manualAccept(m.sd).then(function () { startP2pTimer('host'); })
-          .catch(function () { st.accepted = false; });
-      } else if (role === 'guest' && m.k === 'o' && !st.answer && !st.answering) {
+        manualAccept(m.sd).then(function () { tr('accept-ok'); startP2pTimer('host'); })
+          .catch(function (e) {
+            // 应答已应用过（stable 上再 setRemote）→ 视为已接受，别让重复应答反复重试
+            if (e && String(e).indexOf('wrong state: stable') >= 0) st.accepted = true;
+            else st.accepted = false;
+            tr('accept-err ' + e);
+          });
+      } else if (role === 'guest' && m.k === 'o') {
+        // 直连健康 → 不再理会 offer；同一份 offer 只应答一次；
+        // 房主重发新 offer（对方刷新重进后的兜底重连）→ 重新应答
+        if (settled && conn && conn.open && !conn._relay) { tr('offer-drop healthy'); return; }
+        if (st.answering) { tr('offer-drop answering'); return; }
+        if (st.answer && st.lastOffer === m.sd) { tr('offer-drop same'); return; }
+        tr('offer-recv');
+        st.lastOffer = m.sd;
         st.answering = true;
         manualAnswer(m.sd).then(function (code) {
           st.answering = false;
           st.answer = code;
           startP2pTimer('guest');
+          tr('ans-pub');
           pub({ k: 'a', sd: code, sid: st.sid });
-        }).catch(function () { st.answering = false; });
+        }).catch(function (e) { tr('ans-err ' + e); st.answering = false; st.lastOffer = null; });
       }
     };
 
     mq.onerror = function () {};
     mq.onclose = function () {
+      tr('mq-close settled=' + settled + ' relay=' + !!(conn && conn._relay));
       if (mqttSig === st) st.mq = null;   // 总线已断，允许 resume 重建
       if (mqttSig !== st) return;
       if (settled && conn && conn._relay) { clearHb(); emit('closed'); return; }
@@ -502,6 +591,7 @@ const Net = (function () {
     destroy: destroy,
     isConnected: isConnected,
     signalingPending: signalingPending,
-    resume: resume
+    resume: resume,
+    _trace: _trace
   };
 })();

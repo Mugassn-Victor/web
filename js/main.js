@@ -97,36 +97,6 @@
     if (!App.state) { App.history = []; App.state = Rules.derive(App.history); }
   }
 
-  function computeLog() {
-    let st = Rules.initialState();
-    const out = [];
-    for (let i = 0; i < App.history.length; i++) {
-      const m = App.history[i];
-      const p = st[m.from[0]][m.from[1]];
-      if (!p) break;
-      out.push({ side: p.side, text: Rules.moveText(st, m.from, m.to) });
-      st = Rules.applyMove(st, m.from, m.to);
-    }
-    return out;
-  }
-
-  function capturedOf(side) {
-    const init = { A: 2, B: 2, N: 2, R: 2, C: 2, P: 5, K: 1 };
-    const have = { A: 0, B: 0, N: 0, R: 0, C: 0, P: 0, K: 0 };
-    for (let r = 0; r < 10; r++) {
-      for (let c = 0; c < 9; c++) {
-        const p = App.state[r][c];
-        if (p && p.side === side) have[p.type]++;
-      }
-    }
-    let out = '';
-    ['R', 'N', 'B', 'A', 'C', 'P', 'K'].forEach(function (t) {
-      const missing = init[t] - have[t];
-      for (let i = 0; i < missing; i++) out += Rules.NAME[side][t];
-    });
-    return out;
-  }
-
   function render() {
     if (!App.state) return;
     const turn = currentTurn();
@@ -135,7 +105,6 @@
 
     UI.render(App.state, {
       sel: App.sel,
-      targets: App.targets,
       lastMove: lastMove,
       checkSide: stt.check ? turn : null
     });
@@ -159,42 +128,6 @@
       App.history.length < 2 || !myTurn();
     $('btnResign').disabled = busy || App.phase !== 'playing';
     $('btnRestart').disabled = busy || App.phase !== 'over' || App.pendingRestart;
-
-    // 棋谱
-    const log = computeLog();
-    const ol = $('moveLog');
-    ol.innerHTML = '';
-    for (let i = 0; i < log.length; i += 2) {
-      const li = document.createElement('li');
-      const num = document.createElement('span');
-      num.className = 'num';
-      num.textContent = (i / 2 + 1) + '.';
-      li.appendChild(num);
-      const a = document.createElement('span');
-      a.className = log[i].side === RED ? 'mv-r' : 'mv-b';
-      a.textContent = log[i].text;
-      li.appendChild(a);
-      if (log[i + 1]) {
-        const b = document.createElement('span');
-        b.className = log[i + 1].side === RED ? 'mv-r' : 'mv-b';
-        b.textContent = log[i + 1].text;
-        li.appendChild(b);
-      }
-      ol.appendChild(li);
-    }
-    ol.scrollTop = ol.scrollHeight;
-
-    // 被吃棋子
-    const mine = capturedOf(App.mySide);
-    const theirs = capturedOf(App.mySide === RED ? BLACK : RED);
-    $('capMine').innerHTML = mine ? chars(mine, App.mySide) : '—';
-    $('capTheirs').innerHTML = theirs ? chars(theirs, App.mySide === RED ? BLACK : RED) : '—';
-  }
-
-  function chars(str, side) {
-    return str.split('').map(function (ch) {
-      return '<span class="' + side + '">' + ch + '</span>';
-    }).join('');
   }
 
   /* ================= 走棋 ================= */
@@ -251,20 +184,36 @@
     App.phase = 'over';
     const loser = currentTurn();
     const winner = stt.winner;
+    const pattern = (stt.reason === 'checkmate' || stt.reason === 'stalemate')
+      ? (Rules.matePattern(App.state, loser) || (stt.reason === 'checkmate' ? '绝杀' : '困毙'))
+      : '';
     const reasonMap = {
-      checkmate: sideName(loser) + '被将死',
+      checkmate: pattern && pattern !== '绝杀'
+        ? sideName(loser) + '被' + pattern + '绝杀'
+        : sideName(loser) + '被将死',
       stalemate: sideName(loser) + '困毙无路',
       king: sideName(loser) + '将帅被擒'
     };
     const reason = reasonMap[stt.reason] || '对局结束';
     render();
     if (winner === App.mySide) UI.sound.win(); else UI.sound.lose();
-    modal(winner === App.mySide ? '胜利' : '失败',
-      reason + '\n' + sideName(winner) + '获胜',
-      [
-        { label: '再来一局', primary: true, onClick: function () { closeModal(); requestRestart(); } },
-        { label: '返回大厅', onClick: leaveToLobby }
-      ]);
+    const showModal = function () {
+      modal(winner === App.mySide ? '胜利' : '失败',
+        reason + '\n' + sideName(winner) + '获胜',
+        [
+          { label: '再来一局', primary: true, onClick: function () { closeModal(); requestRestart(); } },
+          { label: '返回大厅', onClick: leaveToLobby }
+        ]);
+    };
+    if (stt.reason === 'checkmate') {
+      UI.fxFinish(pattern.split('').join(' '));
+      setTimeout(showModal, 800);
+    } else if (stt.reason === 'stalemate') {
+      UI.fxFinish('困 毙');
+      setTimeout(showModal, 800);
+    } else {
+      showModal();
+    }
   }
 
   function forceOver(winner, reason) {
@@ -471,12 +420,9 @@
     UI.setOrientation(side);
     render();
 
-    // 记住本局房间，误关页面后可恢复（startGame 才算真正入局）
-    try {
-      localStorage.setItem('xq-resume', JSON.stringify({
-        code: App.roomId, mode: App.mode, side: side, ts: Date.now()
-      }));
-    } catch (e) {}
+    // 静默记住本局身份：掉线重开页面后，输同一个房间号可自动接管重建。
+    // 用 location.hash（每个框架各自独立；localStorage 同源共享会被对手覆盖）
+    location.hash = 'r=' + App.mode + '-' + App.roomId;
   }
 
   /* --- 加入房间倒计时 --- */
@@ -498,9 +444,10 @@
       if (waitLeft <= 0) {
         stopWait();
         if (Net.isConnected()) return;
+        // 一直没人应答：可能是房主重新输号恢复 → 用这个号自己建房继续
         Net.destroy();
-        lobbyStatus('连接超时：对方可能不在房间或网络不畅，可重试', true);
-        backToButtons();
+        createRoom(roomId, true);
+        lobbyStatus('无人应答，已用此号为你建房，等待对手加入…');
         return;
       }
       lobbyStatus('正在连接房间 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
@@ -514,6 +461,7 @@
     $('btnJoin').disabled = true;
     App.roomId = code || randCode();
     App.hostRetries = 0;
+    location.hash = 'r=host-' + App.roomId;
     // 房间号本地生成，不依赖信令服务器回传，立即显示
     $('roomCode').textContent = App.roomId;
     $('hostPanel').classList.remove('hidden');
@@ -527,8 +475,16 @@
       lobbyStatus('请输入 6 位数字房间号', true);
       return;
     }
+    // 静默身份记忆（location.hash，按框架独立）：我上次是这个房间的房主 → 直接用该号重建
+    const hm = /^#r=host-(\d{6})$/.exec(location.hash);
+    if (hm && hm[1] === val) {
+      lobbyStatus('正在恢复你的房间…');
+      createRoom(val, true);
+      return;
+    }
     App.mode = 'guest';
     App.roomId = val;
+    location.hash = 'r=guest-' + val;
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
     Net.join(val);
@@ -543,7 +499,7 @@
   }
 
   function leaveToLobby() {
-    try { localStorage.removeItem('xq-resume'); } catch (e) {}
+    location.hash = '';
     stopResumeRetry();
     Net.destroy();
     location.reload();
@@ -607,6 +563,12 @@
       startGame(info.role === 'host' ? RED : BLACK, !!info.relay);
       // 请求棋谱：若对方是进行中的棋局（自己刚重新加入），会同步恢复局面
       Net.send({ t: 'sync-req' });
+      // 公共 broker 是 QoS0，sync-req 偶发丢失会让棋谱永远空着 → 恢复前重试
+      let tries = 0;
+      const iv = setInterval(function () {
+        if (App.history.length > 0 || ++tries > 3) { clearInterval(iv); return; }
+        Net.send({ t: 'sync-req' });
+      }, 2000);
     });
 
     // P2P 打不通 → 已切到 broker 中继，对局继续
@@ -657,14 +619,23 @@
       if ($('modalTitle').textContent === '对方掉线') closeModal();
       render();
       toast(wasOff ? '对方已重新连线，对局继续' : '点对点直连已恢复');
+      // 主动推棋谱：对方可能刚重新进入页面，其 sync-req 可能早于通道就绪被丢弃
+      if (App.history.length) Net.send({ t: 'sync', hist: App.history });
     });
 
     Net.on('error', function (e) {
       const type = e && e.type;
       if (App.mode === 'host' && type === 'unavailable-id' && App.recovering) {
-        lobbyStatus('原房间号仍被占用（原页面可能还没关闭），请关闭旧页面后再恢复', true);
+        // 该号已有一个活着的房间（旧页面还开着，或身份记忆被其他标签页覆盖）
+        // → 不卡住，直接改以客方身份加入，进局后同步恢复棋谱
         App.recovering = false;
-        backToButtons();
+        App.mode = 'guest';
+        location.hash = 'r=guest-' + App.roomId;
+        Net.destroy();
+        $('hostPanel').classList.add('hidden');
+        $('roomCode').textContent = '------';
+        Net.join(App.roomId);
+        startJoinCountdown(App.roomId);
         return;
       }
       if (App.mode === 'host' && type === 'unavailable-id' && App.hostRetries < 3) {
@@ -675,15 +646,20 @@
         lobbyStatus('房间号冲突，正在换号…');
         return;
       }
+      if (App.phase !== 'lobby') return;   // 对局中出错交给断线重连机制，不打断棋局
+      if (App.mode === 'guest' && type === 'peer-unavailable') {
+        // 没人开这个房 → 自动用该号建房（房主掉线重进，或抢先开局）
+        Net.destroy();
+        createRoom(App.roomId, true);
+        lobbyStatus('房间无人应答，已用此号为你建房，等待对手加入…');
+        return;
+      }
       // 主信令报错但备用信令还在尝试：继续等，不打断
       if (Net.signalingPending()) {
         lobbyStatus('主信令不通，正在尝试备用信令…');
         return;
       }
-      if (App.phase !== 'lobby') return;   // 对局中出错交给断线重连机制，不打断棋局
-      if (App.mode === 'guest' && type === 'peer-unavailable') {
-        lobbyStatus('房间不存在或对方已离开', true);
-      } else if (type === 'network' || type === 'server-error' || type === 'socket-error') {
+      if (type === 'network' || type === 'server-error' || type === 'socket-error') {
         lobbyStatus('网络错误：无法连接信令服务器', true);
       } else {
         lobbyStatus('连接出错：' + (e && e.message ? e.message : type), true);
@@ -709,22 +685,8 @@
     if (typeof Peer === 'undefined' && typeof MiniMQTT === 'undefined') {
       lobbyStatus('联机组件加载失败（需要联网），请刷新重试', true);
     }
-    // 误关页面后恢复：显示上次的房间入口
-    let resume = null;
-    try { resume = JSON.parse(localStorage.getItem('xq-resume')); } catch (e) {}
-    if (resume && /^\d{6}$/.test(resume.code)) {
-      $('resumeRow').classList.remove('hidden');
-      $('resumeInfo').textContent = '房间 ' + resume.code + '（' +
-        (resume.side === RED ? '你执红方' : '你执黑方') + '）';
-      $('btnResume').onclick = function () {
-        if (resume.mode === 'host') {
-          createRoom(resume.code, true);
-        } else {
-          $('roomInput').value = resume.code;
-          joinRoom();
-        }
-      };
-    }
+    // 测试钩子：E2E 通过 window.App 读取对局状态
+    window.App = App;
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
