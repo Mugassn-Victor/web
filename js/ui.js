@@ -118,6 +118,30 @@ const UI = (function () {
     o.connect(g); g.connect(ctx.destination);
     o.start(t0); o.stop(t0 + dur + 0.02);
   }
+  // mp3 音效播放器：落子声 chess.mp3（按文件缓存 Audio，可快速重播）
+  const sfxEls = {};
+  let sfxFile = '';
+  function sfxPreload(file) {
+    try {
+      if (!sfxEls[file]) {
+        const el = new Audio(file);
+        el.preload = 'auto';
+        sfxEls[file] = el;
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  function sfxPlay(file, vol) {
+    try {
+      let el = sfxEls[file];
+      if (!el) { sfxPreload(file); el = sfxEls[file]; }
+      if (!el) return;
+      el.volume = vol == null ? 0.85 : vol;
+      try { if (el.currentTime > 0.05) el.currentTime = 0; } catch (e) { /* 忽略 */ }
+      const p = el.play();
+      if (p && p.catch) p.catch(function () { /* 被策略拦下，手势后自然可播 */ });
+      sfxFile = file;
+    } catch (e) { /* 忽略 */ }
+  }
   // 系统语音喊招（吃/将军），无 TTS 时静默降级为纯音效
   function speak(text) {
     if (typeof window === 'undefined' || !window.speechSynthesis || !window.SpeechSynthesisUtterance) return false;
@@ -137,16 +161,16 @@ const UI = (function () {
     } catch (e) { return false; }
   }
   const sound = {
-    // 落棋：清脆一声"嗒"
-    move: function () { beep(880, 0.06, 'triangle', 0.30); beep(220, 0.10, 'sine', 0.26, 0.02); },
-    // 吃子：重"啪"+ 低音锤，再喊一声"吃"
-    capture: function () {
-      beep(340, 0.10, 'square', 0.30);
-      beep(140, 0.18, 'triangle', 0.30, 0.03);
-      beep(880, 0.06, 'triangle', 0.20, 0.07);
-      speak('吃');
+    // 落子：chess.mp3 真实棋子声
+    move: function () {
+      sfxPlay('chess.mp3', 0.85);
     },
-    check: function () { beep(740, 0.09, 'square', 0.22); beep(740, 0.09, 'square', 0.22, 0.16); speak('将军'); },
+    // 吃子：eat.mp3（文件自带声音，不再叠 TTS）
+    capture: function () {
+      sfxPlay('eat.mp3', 0.9);
+    },
+    // 将军：jiangjun.mp3（文件自带声音，不再叠合成音/TTS）
+    check: function () { sfxPlay('jiangjun.mp3', 0.9); },
     win: function () { beep(523, 0.12, 'triangle', 0.24); beep(659, 0.12, 'triangle', 0.24, 0.13); beep(784, 0.2, 'triangle', 0.24, 0.26); },
     lose: function () { beep(440, 0.16, 'sawtooth', 0.20); beep(330, 0.24, 'sawtooth', 0.20, 0.17); },
     // 诊断：给 E2E / 排查用
@@ -154,6 +178,7 @@ const UI = (function () {
       return {
         ctx: actx ? actx.state : 'none',
         tts: !!(window.speechSynthesis && window.SpeechSynthesisUtterance),
+        file: sfxFile,
         calls: speechCalls
       };
     },
@@ -215,6 +240,11 @@ const UI = (function () {
 
     // 进页面即尝试播背景音乐（被策略拦下时，上面首次手势会补播）
     bgmPlay();
+
+    // 预载木质落子声
+    sfxPreload('chess.mp3');
+    sfxPreload('eat.mp3');
+    sfxPreload('jiangjun.mp3');
   }
 
   function setOrientation(side) {
