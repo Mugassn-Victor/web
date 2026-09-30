@@ -296,6 +296,7 @@ const Rules = (function () {
   function cellName(r, c) { return (9 - c) + ',' + (9 - r); }
 
   // ===== 绝杀棋型识别（sideToMove = 被将死方） =====
+  // 同时符合多个棋型时全部收集（去重），按典型度顺序用「、」连接；一个都不匹配则返回「绝杀」
   function matePattern(state, sideToMove) {
     const st = status(state, sideToMove);
     if (!st.over) return null;
@@ -313,6 +314,10 @@ const Rules = (function () {
     const pawnRow = loser === BLACK ? 3 : 6;
     const fishRow = loser === BLACK ? 2 : 7;
 
+    const matches = [];
+    function hit(name) { if (matches.indexOf(name) < 0) matches.push(name); }
+    function done() { return matches.length ? matches.join('、') : '绝杀'; }
+
     function attacksKing(p, r, c) {
       const ms = pseudoMoves(state, r, c, p);
       for (let i = 0; i < ms.length; i++) {
@@ -321,7 +326,7 @@ const Rules = (function () {
       return false;
     }
 
-    // 攻方照将子清单（含将帅照面）
+    // 攻方照将子清单（将帅照面单独计）
     const checkers = [];
     for (let r = 0; r < 10; r++) {
       for (let c = 0; c < 9; c++) {
@@ -330,11 +335,9 @@ const Rules = (function () {
       }
     }
     const facing = kingsFacing(state);
-    if (checkers.length + (facing ? 1 : 0) >= 2) return '双将';
-    if (facing) return '对面笑';
-    if (!checkers.length) return '绝杀';
-    const ch = checkers[0];
-    const type = ch.p.type;
+    if (checkers.length + (facing ? 1 : 0) >= 2) hit('双将');
+    if (facing) hit('对面笑');
+    if (!checkers.length) return done();
 
     // 马是否参与（将军或控制将门）
     function nInRole(r, c) {
@@ -361,50 +364,59 @@ const Rules = (function () {
       return false;
     }
 
-    // 炮型：按唯一炮架性质区分
-    if (type === 'C') {
-      const dr = Math.sign(kr - ch.r), dc = Math.sign(kc - ch.c);
-      if (dr === 0 || dc === 0) {
-        let screen = null, cnt = 0;
-        let r = ch.r + dr, c = ch.c + dc;
-        while (r !== kr || c !== kc) {
-          const p = state[r][c];
-          if (p) { screen = p; cnt++; }
-          r += dr; c += dc;
-        }
-        if (cnt === 1 && screen) {
-          if (screen.side === winner && screen.type === 'N') return '马后炮';
-          if (screen.side === winner && screen.type === 'C') return '重炮';
-          if (screen.side === loser) return '闷宫';
-        }
-      }
-    }
+    let hasRChecker = false;
 
-    // 铁门栓：车/兵贴身封锁将门 + 中线炮或借帅力
-    if ((type === 'R' || type === 'P') && Math.abs(kr - ch.r) + Math.abs(kc - ch.c) === 1) {
-      let cannon = false;
-      for (let r = 0; r < 10; r++) {
-        const p = state[r][kc];
-        if (p && p.side === winner && p.type === 'C') { cannon = true; break; }
-      }
-      let kingPower = false;
-      const wk = findKing(state, winner);
-      if (wk && wk[1] === ch.c) {
-        const lo = Math.min(wk[0], ch.r), hi = Math.max(wk[0], ch.r);
-        kingPower = true;
-        for (let r = lo + 1; r < hi; r++) {
-          if (state[r][ch.c]) { kingPower = false; break; }
+    // 逐个照将子识别子力型棋型（炮型 / 铁门栓 / 双车错）
+    for (let ci = 0; ci < checkers.length; ci++) {
+      const ch = checkers[ci];
+      const type = ch.p.type;
+      if (type === 'R') hasRChecker = true;
+
+      // 炮型：按唯一炮架性质区分
+      if (type === 'C') {
+        const dr = Math.sign(kr - ch.r), dc = Math.sign(kc - ch.c);
+        if (dr === 0 || dc === 0) {
+          let screen = null, cnt = 0;
+          let r = ch.r + dr, c = ch.c + dc;
+          while (r !== kr || c !== kc) {
+            const p = state[r][c];
+            if (p) { screen = p; cnt++; }
+            r += dr; c += dc;
+          }
+          if (cnt === 1 && screen) {
+            if (screen.side === winner && screen.type === 'N') hit('马后炮');
+            if (screen.side === winner && screen.type === 'C') hit('重炮');
+            if (screen.side === loser) hit('闷宫');
+          }
         }
       }
-      if (cannon || kingPower) return '铁门栓';
-    }
 
-    // 双车错：另一车控将门纵横线
-    if (type === 'R') {
-      for (let r = 0; r < 10; r++) {
-        for (let c = 0; c < 9; c++) {
-          const p = state[r][c];
-          if (p && p !== ch.p && p.side === winner && p.type === 'R' && (r === kr || c === kc)) return '双车错';
+      // 铁门栓：车/兵贴身封锁将门 + 中线炮或借帅力
+      if ((type === 'R' || type === 'P') && Math.abs(kr - ch.r) + Math.abs(kc - ch.c) === 1) {
+        let cannon = false;
+        for (let r = 0; r < 10; r++) {
+          const p = state[r][kc];
+          if (p && p.side === winner && p.type === 'C') { cannon = true; break; }
+        }
+        let kingPower = false;
+        const wk = findKing(state, winner);
+        if (wk && wk[1] === ch.c) {
+          const lo = Math.min(wk[0], ch.r), hi = Math.max(wk[0], ch.r);
+          kingPower = true;
+          for (let r = lo + 1; r < hi; r++) {
+            if (state[r][ch.c]) { kingPower = false; break; }
+          }
+        }
+        if (cannon || kingPower) hit('铁门栓');
+      }
+
+      // 双车错：另一车控将门纵横线
+      if (type === 'R') {
+        for (let r = 0; r < 10; r++) {
+          for (let c = 0; c < 9; c++) {
+            const p = state[r][c];
+            if (p && p !== ch.p && p.side === winner && p.type === 'R' && (r === kr || c === kc)) hit('双车错');
+          }
         }
       }
     }
@@ -414,19 +426,19 @@ const Rules = (function () {
       return cornerRows.indexOf(r) >= 0 && (c === 3 || c === 5) &&
         (attacksKing(state[r][c], r, c) ||
           (Math.abs(r - kr) === 2 && Math.abs(c - kc) === 2 && nInRole(r, c)));
-    })) return '八角马';
+    })) hit('八角马');
     if (anyOwnN(function (r, c) {
       return r === kr + dir && Math.abs(c - kc) === 2 && attacksKing(state[r][c], r, c);
-    })) return '卧槽马';
+    })) hit('卧槽马');
     if (anyOwnN(function (r, c) {
       return r === pawnRow && (c === 2 || c === 6) && nInRole(r, c);
-    })) return '侧面虎';
-    if (type === 'R' && anyOwnN(function (r, c) {
+    })) hit('侧面虎');
+    if (hasRChecker && anyOwnN(function (r, c) {
       return Math.abs(r - kr) === 2 && Math.abs(c - kc) === 2 && nInRole(r, c);
-    })) return '列马车';
+    })) hit('列马车');
     if (anyOwnN(function (r, c) {
       return r === fishRow && (c === 2 || c === 6) && nInRole(r, c);
-    })) return '钓鱼马';
+    })) hit('钓鱼马');
 
     // 双炮配合类
     const cannons = [];
@@ -445,13 +457,13 @@ const Rules = (function () {
           if (cannons[i].r === cannons[j].r || cannons[i].c === cannons[j].c) { aligned = true; break; }
         }
       }
-      if (aligned && hasR) return '夹车炮';
+      if (aligned && hasR) hit('夹车炮');
       let bottom = false, onFile = false;
       for (let i = 0; i < cannons.length; i++) {
         if (cannons[i].r === backRow) bottom = true;
         if (cannons[i].c === kc) onFile = true;
       }
-      if (bottom && onFile) return '天地炮';
+      if (bottom && onFile) hit('天地炮');
     }
 
     // 闷杀：将的退路被己方棋子堵死
@@ -463,9 +475,58 @@ const Rules = (function () {
       const p = state[qr][qc];
       if (p && p.side === loser) blockedOwn++;
     }
-    if (blockedOwn >= 3) return '闷杀';
+    if (blockedOwn >= 3) hit('闷杀');
 
-    return '绝杀';
+    return done();
+  }
+
+  // ===== 无根棋子：被对方攻击且己方无子护卫（将帅不计） =====
+  function attackSet(state, bySide) {
+    const s = new Set();
+    for (let r = 0; r < 10; r++) {
+      for (let c = 0; c < 9; c++) {
+        const p = state[r][c];
+        if (!p || p.side !== bySide) continue;
+        const ms = pseudoMoves(state, r, c, p);
+        for (let i = 0; i < ms.length; i++) s.add(ms[i][0] * 9 + ms[i][1]);
+      }
+    }
+    return s;
+  }
+
+  // 返回 { r: [[r,c]…], b: [[r,c]…] } —— 无根被攻的棋子（供红/绿高亮）
+  function hanging(state) {
+    const res = { r: [], b: [] };
+    const sides = [RED, BLACK];
+    for (let si = 0; si < 2; si++) {
+      const side = sides[si];
+      const enemy = side === RED ? BLACK : RED;
+      const eAtk = attackSet(state, enemy);
+      const dummy = { side: enemy, type: 'P' };
+      for (let r = 0; r < 10; r++) {
+        for (let c = 0; c < 9; c++) {
+          const p = state[r][c];
+          if (!p || p.side !== side || p.type === 'K') continue;
+          if (!eAtk.has(r * 9 + c)) continue;
+          // 换成敌方假子后，己方对其落点的攻击即"护卫"（含炮架判定）
+          state[r][c] = dummy;
+          let def = false;
+          for (let rr = 0; rr < 10 && !def; rr++) {
+            for (let cc = 0; cc < 9 && !def; cc++) {
+              const q = state[rr][cc];
+              if (!q || q.side !== side) continue;
+              const ms = pseudoMoves(state, rr, cc, q);
+              for (let i = 0; i < ms.length; i++) {
+                if (ms[i][0] === r && ms[i][1] === c) { def = true; break; }
+              }
+            }
+          }
+          state[r][c] = p;
+          if (!def) res[side].push([r, c]);
+        }
+      }
+    }
+    return res;
   }
 
   return {
@@ -486,7 +547,8 @@ const Rules = (function () {
     derive: derive,
     moveText: moveText,
     cellName: cellName,
-    matePattern: matePattern
+    matePattern: matePattern,
+    hanging: hanging
   };
 })();
 

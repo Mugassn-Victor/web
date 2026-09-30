@@ -107,7 +107,8 @@
     UI.render(App.state, {
       sel: App.sel,
       lastMove: lastMove,
-      checkSide: stt.check ? turn : null
+      checkSide: stt.check ? turn : null,
+      mySide: App.mySide
     });
 
     // 顶栏
@@ -207,7 +208,7 @@
         ]);
     };
     if (stt.reason === 'checkmate') {
-      UI.fxFinish(pattern.split('').join(' '));
+      UI.fxFinish(pattern.replace(/、/g, ' ').split('').join(' '));
       setTimeout(showModal, 800);
     } else if (stt.reason === 'stalemate') {
       UI.fxFinish('困 毙');

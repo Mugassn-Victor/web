@@ -63,12 +63,11 @@ const UI = (function () {
       });
     });
 
-    // 楚河 汉界
-    const t1 = T(4.5, 2), t2 = T(4.5, 6);
-    const rot = orientation === 'b';
+    // 楚河 汉界（始终朝当前视角正立，楚河在左、汉界在右）
+    const t1 = orientation === 'r' ? T(4.5, 2) : T(4.5, 6);
+    const t2 = orientation === 'r' ? T(4.5, 6) : T(4.5, 2);
     const txt = function (p, s) {
-      const tr = rot ? ' transform="rotate(180 ' + p[0] + ' ' + p[1] + ')"' : '';
-      return '<text x="' + p[0] + '" y="' + p[1] + '"' + tr +
+      return '<text x="' + p[0] + '" y="' + p[1] + '"' +
         ' text-anchor="middle" dominant-baseline="central" font-size="0.72"' +
         ' letter-spacing="0.18"' +
         ' font-family="STKaiti,KaiTi,SimSun,serif" fill="#6b4420" opacity="0.9">' + s + '</text>';
@@ -105,8 +104,10 @@ const UI = (function () {
     o.start(t0); o.stop(t0 + dur + 0.02);
   }
   const sound = {
-    move: function () { beep(430, 0.07, 'triangle', 0.16); },
-    capture: function () { beep(240, 0.12, 'square', 0.10); beep(180, 0.14, 'triangle', 0.10, 0.05); },
+    // 落棋：清脆一声"嗒"
+    move: function () { beep(660, 0.05, 'triangle', 0.16); beep(210, 0.09, 'sine', 0.14, 0.02); },
+    // 吃子：更重的"啪"+ 低音锤
+    capture: function () { beep(340, 0.09, 'square', 0.14); beep(140, 0.16, 'triangle', 0.16, 0.03); beep(880, 0.05, 'triangle', 0.10, 0.06); },
     check: function () { beep(740, 0.09, 'square', 0.12); beep(740, 0.09, 'square', 0.12, 0.16); },
     win: function () { beep(523, 0.12, 'triangle', 0.14); beep(659, 0.12, 'triangle', 0.14, 0.13); beep(784, 0.2, 'triangle', 0.14, 0.26); },
     lose: function () { beep(440, 0.16, 'sawtooth', 0.10); beep(330, 0.24, 'sawtooth', 0.10, 0.17); }
@@ -133,6 +134,14 @@ const UI = (function () {
     fitFont();
     if (window.ResizeObserver) new ResizeObserver(fitFont).observe(board);
     else window.addEventListener('resize', fitFont);
+
+    // 音频需在首次用户手势时解锁，否则首次音效会被浏览器挂起吞掉
+    const unlock = function () {
+      const c = ac();
+      if (c && c.state === 'suspended' && c.resume) c.resume().catch(function () {});
+    };
+    document.addEventListener('pointerdown', unlock, true);
+    document.addEventListener('keydown', unlock, true);
   }
 
   function setOrientation(side) {
@@ -152,6 +161,15 @@ const UI = (function () {
     const alive = new Set();
     const lm = opts.lastMove;
 
+    // 无根被攻：我方=红(危险)，对方=绿(可吃)
+    let dangerSet = null, preySet = null;
+    if (opts.mySide === 'r' || opts.mySide === 'b') {
+      const hang = Rules.hanging(state);
+      const foe = opts.mySide === 'r' ? 'b' : 'r';
+      dangerSet = new Set(hang[opts.mySide].map(function (k) { return k[0] + ',' + k[1]; }));
+      preySet = new Set(hang[foe].map(function (k) { return k[0] + ',' + k[1]; }));
+    }
+
     for (let r = 0; r < 10; r++) {
       for (let c = 0; c < 9; c++) {
         const p = state[r][c];
@@ -169,6 +187,8 @@ const UI = (function () {
         const isSel = opts.sel && opts.sel[0] === r && opts.sel[1] === c;
         el.classList.toggle('sel', !!isSel);
         el.classList.toggle('check', opts.checkSide === p.side && p.type === 'K');
+        el.classList.toggle('danger', dangerSet && dangerSet.has(r + ',' + c));
+        el.classList.toggle('prey', preySet && preySet.has(r + ',' + c));
         // 走子动画：一手棋只播一次
         if (lm && lm !== lastFxMove && lm.to[0] === r && lm.to[1] === c) {
           el.classList.remove('moving');
@@ -182,6 +202,7 @@ const UI = (function () {
       if (!alive.has(p)) {
         pieceEls.delete(p);
         // 被吃的棋子：爆裂光效 + 缩小消失
+        el.classList.remove('danger', 'prey');
         el.classList.add('dying');
         burstAt(el.style.left, el.style.top);
         setTimeout(function () { el.remove(); }, 300);

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><title>running</title></head>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>running</title><script src="js/rules.js"></script></head>
 <body>
 <pre id="out">running…</pre>
 <div style="display:flex;gap:10px">
@@ -96,6 +96,16 @@ function reloadFrame(i) {
   try { f.contentWindow.location.reload(); }
   catch (e) { f.src = PAGE; }
 }
+// 音效计数（页面重载后需重新安装；按页幂等）
+function instSound(i) {
+  try {
+    W(i).eval('(function () { if (UI.sound.__inst) return; UI.sound.__inst = 1;' +
+      'window.__mv = 0; window.__cap = 0;' +
+      'var om = UI.sound.move, oc = UI.sound.capture;' +
+      'UI.sound.move = function () { window.__mv++; om(); };' +
+      'UI.sound.capture = function () { window.__cap++; oc(); };})()');
+  } catch (e) { }
+}
 async function waitReady(i) {
   return await until(() => {
     const b = g(i, 'btnCreate');
@@ -163,6 +173,7 @@ async function waitRejoined(i, n, budgetMs) {
   }, 800);
   check('双端脚本就绪', bothReady);
   if (!bothReady) { finish(); return; }
+  instSound(0); instSound(1);
 
   // ===== 1. 创建 / 加入 =====
   click(0, 'btnCreate');
@@ -378,6 +389,7 @@ async function waitRejoined(i, n, budgetMs) {
           pieceCount(0) + '/' + pieceCount(1));
       }
     }
+    instSound(0); instSound(1);   // 刷新/重载后重新安装音效计数
 
     // ===== 10.5 过河兵可以左右移动 =====
     cellClick(1, 6, 0); cellClick(1, 5, 0);            // 红 兵 (6,0)->(5,0)
@@ -400,6 +412,129 @@ async function waitRejoined(i, n, budgetMs) {
       check('绝杀特效元素出现', !!D(0).querySelector('.check-fx.finish'));
     } catch (e) {
       check('绝杀特效元素出现', false, String(e));
+    }
+
+    // ===== 11.5 绝杀棋型识别（多棋型同时符合时顿号分隔全显示） =====
+    function craftMate(setup, side) {
+      const st = Rules.initialState();
+      for (let r = 0; r < 10; r++) for (let c = 0; c < 9; c++) st[r][c] = null;
+      setup.forEach(function (x) { st[x[0]][x[1]] = { side: x[2], type: x[3] }; });
+      const stt = Rules.status(st, side);
+      return { stt: stt, pat: Rules.matePattern(st, side) };
+    }
+    let mm;
+
+    // 马后炮：炮(6,4)以马(2,4)为架，车(1,0)封锁将门横线
+    mm = craftMate([[9, 4, 'r', 'K'], [6, 4, 'r', 'C'], [2, 4, 'r', 'N'], [1, 0, 'r', 'R'], [0, 4, 'b', 'K']], 'b');
+    check('棋型识别:马后炮', mm.stt.reason === 'checkmate' && mm.pat === '马后炮',
+      mm.stt.reason + '/' + mm.pat);
+
+    // 对面笑：将帅照面且黑方无路可走
+    mm = craftMate([[9, 4, 'r', 'K'], [1, 3, 'r', 'R'], [1, 5, 'r', 'R'], [3, 3, 'r', 'N'], [0, 4, 'b', 'K']], 'b');
+    check('棋型识别:对面笑', mm.stt.reason === 'checkmate' && mm.pat === '对面笑',
+      mm.stt.reason + '/' + mm.pat);
+
+    // 困毙：黑将未被照将但无子可动
+    mm = craftMate([[9, 4, 'r', 'K'], [2, 2, 'r', 'N'], [2, 6, 'r', 'N'], [1, 0, 'r', 'R'], [5, 4, 'r', 'P'], [0, 4, 'b', 'K']], 'b');
+    check('棋型识别:困毙', mm.stt.reason === 'stalemate' && mm.pat === '困毙',
+      mm.stt.reason + '/' + mm.pat);
+
+    // 多棋型同时符合：重炮 + 钓鱼马 + 夹车炮
+    mm = craftMate([[9, 4, 'r', 'K'], [3, 4, 'r', 'C'], [5, 4, 'r', 'C'], [2, 2, 'r', 'N'], [2, 6, 'r', 'N'], [1, 0, 'r', 'R'], [0, 4, 'b', 'K']], 'b');
+    check('棋型识别:多棋型顿号全显示', mm.stt.reason === 'checkmate' && mm.pat === '重炮、钓鱼马、夹车炮',
+      mm.stt.reason + '/' + mm.pat);
+
+    // 双将排首位且附带其它棋型
+    mm = craftMate([[9, 4, 'r', 'K'], [0, 0, 'r', 'R'], [5, 4, 'r', 'R'], [1, 0, 'r', 'R'], [2, 3, 'r', 'N'], [2, 6, 'r', 'N'], [0, 4, 'b', 'K']], 'b');
+    check('棋型识别:双将开头且多棋型', mm.stt.reason === 'checkmate' && mm.pat.indexOf('双将') === 0 && mm.pat.indexOf('、') > 0,
+      mm.stt.reason + '/' + mm.pat);
+
+    // 非终局不识别
+    check('棋型识别:非终局返回null', Rules.matePattern(Rules.initialState(), 'r') === null, '');
+
+    // ===== 11.6 楚河汉界方向（两种视角都正立、楚河在左） =====
+    try {
+      const tinfo = W(0).eval(
+        '(function () {' +
+        '  function g2() {' +
+        '    var ts = document.querySelectorAll("#boardSvg text");' +
+        '    return { n: ts.length, a: ts[0] ? ts[0].textContent : "",' +
+        '      x: ts[0] ? parseFloat(ts[0].getAttribute("x")) : -1,' +
+        '      x2: ts[1] ? parseFloat(ts[1].getAttribute("x")) : -1,' +
+        '      tr: (ts[0] && ts[0].getAttribute("transform")) || "" };' +
+        '  }' +
+        '  var r = g2();' +
+        '  UI.setOrientation("b"); var b = g2();' +
+        '  UI.setOrientation(App.mySide);' +
+        '  return JSON.stringify({ r: r, b: b });' +
+        '})()');
+      const ti = JSON.parse(tinfo);
+      check('楚河在左且正立(红视角)', ti.r.n === 2 && ti.r.a.indexOf('楚') === 0 && ti.r.x < ti.r.x2 && !ti.r.tr,
+        JSON.stringify(ti.r));
+      check('楚河在左且正立(黑视角)', ti.b.n === 2 && ti.b.a.indexOf('楚') === 0 && ti.b.x < ti.b.x2 && !ti.b.tr,
+        JSON.stringify(ti.b));
+    } catch (e) {
+      check('楚河汉界方向', false, String(e));
+    }
+
+    // ===== 11.7 音效：走子已响过 + 合成一手真实吃子只响吃子 =====
+    const mv0 = W(0).eval('window.__mv');
+    check('走子音效已触发', typeof mv0 === 'number' && mv0 >= 3, mv0);
+    try {
+      const F = side(0) === 'r' ? 0 : 1;   // 新局棋谱为空 → 红先手，用执红那一端
+      const capB = W(F).eval('window.__cap'), mvB = W(F).eval('window.__mv');
+      const setupOk = W(F).eval(
+        '(function () {' +
+        '  var A = App;' +
+        '  A.__save = { st: A.state, hist: A.history, phase: A.phase, sel: A.sel, tg: A.targets };' +
+        '  var st = []; for (var r = 0; r < 10; r++) st.push(new Array(9).fill(null));' +
+        '  st[9][4] = { side: "r", type: "K" }; st[5][4] = { side: "r", type: "R" };' +
+        '  st[0][5] = { side: "b", type: "K" }; st[5][0] = { side: "b", type: "P" };' +
+        '  A.state = st; A.history = []; A.phase = "playing"; A.sel = null; A.targets = [];' +
+        '  UI.render(st, { mySide: A.mySide });' +
+        '  return Rules.legalMovesFrom(st, "r", 5, 4).some(function (m) { return m[0] === 5 && m[1] === 0; });' +
+        '})()');
+      check('吃子测试局面就绪', !!setupOk, String(setupOk));
+      cellClick(F, 5, 4);
+      const selOk = selCount(F) === 1;
+      cellClick(F, 5, 0);
+      await sleep(80);
+      const capA = W(F).eval('window.__cap'), mvA = W(F).eval('window.__mv');
+      check('吃子只响吃子音效', selOk && capA === capB + 1 && mvA === mvB,
+        'sel=' + selOk + ' cap=' + capB + '->' + capA + ' mv=' + mvB + '->' + mvA);
+      W(F).eval('(function () { var s = App.__save; if (s) {' +
+        'App.state = s.st; App.history = s.hist; App.phase = s.phase; App.sel = s.sel;' +
+        'App.targets = s.tg; delete App.__save; } })()');
+    } catch (e) {
+      check('吃子音效', false, String(e));
+    }
+
+    // ===== 11.8 无根棋子高亮：我方=红(危险)，对方=绿(可吃) =====
+    try {
+      const hinfo = W(0).eval(
+        '(function () {' +
+        '  var st = []; for (var r = 0; r < 10; r++) st.push(new Array(9).fill(null));' +
+        '  st[9][4] = { side: "r", type: "K" }; st[5][4] = { side: "r", type: "P" }; st[9][0] = { side: "r", type: "R" };' +
+        '  st[0][5] = { side: "b", type: "K" }; st[0][4] = { side: "b", type: "C" }; st[2][4] = { side: "b", type: "N" }; st[0][0] = { side: "b", type: "P" };' +
+        '  var hang = Rules.hanging(st);' +
+        '  UI.render(st, { mySide: "r" });' +
+        '  Array.prototype.forEach.call(document.querySelectorAll("#pieces .piece.dying"), function (e) { e.remove(); });' +
+        '  var d1 = document.querySelectorAll("#pieces .piece.danger");' +
+        '  var p1 = document.querySelectorAll("#pieces .piece.prey");' +
+        '  var d1c = d1.length ? d1[0].className : "";' +
+        '  UI.render(st, { mySide: "b" });' +
+        '  var d2 = document.querySelectorAll("#pieces .piece.danger").length;' +
+        '  var p2 = document.querySelectorAll("#pieces .piece.prey").length;' +
+        '  return JSON.stringify({ hr: hang.r, hb: hang.b, d1: d1.length, p1: p1.length, d1c: d1c, d2: d2, p2: p2 });' +
+        '})()');
+      const hi = JSON.parse(hinfo);
+      check('无根判定:红方无根=1', hi.hr.length === 1 && hi.hr[0][0] === 5 && hi.hr[0][1] === 4, JSON.stringify(hi.hr));
+      check('无根判定:黑方无根=1', hi.hb.length === 1 && hi.hb[0][0] === 0 && hi.hb[0][1] === 0, JSON.stringify(hi.hb));
+      check('我的无根显示红色', hi.d1 === 1 && hi.d1c.indexOf(' r ') > 0 && hi.d1c.indexOf(' danger') > 0, hi.d1c);
+      check('对方无根显示绿色', hi.p1 === 1, hi.p1);
+      check('黑方视角红绿互换', hi.d2 === 1 && hi.p2 === 1, hi.d2 + '/' + hi.p2);
+    } catch (e) {
+      check('无根棋子高亮', false, String(e));
     }
   }
 
