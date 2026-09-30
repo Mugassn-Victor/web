@@ -259,19 +259,62 @@ body {
   50% { box-shadow: 0 0 0 7px rgba(231,76,60,.55), 0 0 18px 5px rgba(231,76,60,.4), 0 5px 9px rgba(0,0,0,.55); }
 }
 
-/* 无根被攻：我方=红环(危险)，对方=绿环(可白吃) */
+/* 无根被攻：我方=红环(危险)，对方=绿环(可白吃)
+   用 box-shadow 而非 outline —— outline 在部分 Safari 上不随圆角渲染 */
 .piece.danger {
-  outline: 3px solid rgba(255, 59, 48, .95);
-  outline-offset: 1px;
+  box-shadow:
+    0 0 0 3px #ff3b30,
+    0 0 14px 5px rgba(255, 59, 48, .55),
+    0 5px 9px rgba(0,0,0,.55),
+    inset 0 2px 4px rgba(255,255,255,.95),
+    inset 0 -5px 7px rgba(150,105,55,.45);
   animation: dangPulse 1.2s ease-in-out infinite;
 }
 @keyframes dangPulse {
-  0%, 100% { outline-color: rgba(255, 59, 48, .95); }
-  50% { outline-color: rgba(255, 59, 48, .30); }
+  0%, 100% {
+    box-shadow:
+      0 0 0 3px #ff3b30,
+      0 0 14px 5px rgba(255, 59, 48, .55),
+      0 5px 9px rgba(0,0,0,.55),
+      inset 0 2px 4px rgba(255,255,255,.95),
+      inset 0 -5px 7px rgba(150,105,55,.45);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px rgba(255, 59, 48, .8),
+      0 0 22px 8px rgba(255, 59, 48, .45),
+      0 5px 9px rgba(0,0,0,.55),
+      inset 0 2px 4px rgba(255,255,255,.95),
+      inset 0 -5px 7px rgba(150,105,55,.45);
+  }
 }
 .piece.prey {
-  outline: 3px solid rgba(46, 204, 113, .95);
-  outline-offset: 1px;
+  box-shadow:
+    0 0 0 3px #2ecc71,
+    0 0 14px 5px rgba(46, 204, 113, .55),
+    0 5px 9px rgba(0,0,0,.55),
+    inset 0 2px 4px rgba(255,255,255,.95),
+    inset 0 -5px 7px rgba(150,105,55,.45);
+}
+/* 选中(金环) + 无根(红/绿环) 同时存在时合并显示 */
+.piece.sel.danger {
+  animation: none;
+  box-shadow:
+    0 0 0 3px var(--accent),
+    0 0 0 7px #ff3b30,
+    0 0 18px 6px rgba(255, 59, 48, .5),
+    0 6px 12px rgba(0,0,0,.6),
+    inset 0 2px 4px rgba(255,255,255,.95),
+    inset 0 -5px 7px rgba(150,105,55,.45);
+}
+.piece.sel.prey {
+  box-shadow:
+    0 0 0 3px var(--accent),
+    0 0 0 7px #2ecc71,
+    0 0 18px 6px rgba(46, 204, 113, .5),
+    0 6px 12px rgba(0,0,0,.6),
+    inset 0 2px 4px rgba(255,255,255,.95),
+    inset 0 -5px 7px rgba(150,105,55,.45);
 }
 
 .mark {

@@ -522,10 +522,12 @@ async function waitRejoined(i, n, budgetMs) {
         '  var d1 = document.querySelectorAll("#pieces .piece.danger");' +
         '  var p1 = document.querySelectorAll("#pieces .piece.prey");' +
         '  var d1c = d1.length ? d1[0].className : "";' +
+        '  var bw = d1.length ? getComputedStyle(d1[0]).boxShadow : "";' +
+        '  var pw = p1.length ? getComputedStyle(p1[0]).boxShadow : "";' +
         '  UI.render(st, { mySide: "b" });' +
         '  var d2 = document.querySelectorAll("#pieces .piece.danger").length;' +
         '  var p2 = document.querySelectorAll("#pieces .piece.prey").length;' +
-        '  return JSON.stringify({ hr: hang.r, hb: hang.b, d1: d1.length, p1: p1.length, d1c: d1c, d2: d2, p2: p2 });' +
+        '  return JSON.stringify({ hr: hang.r, hb: hang.b, d1: d1.length, p1: p1.length, d1c: d1c, d2: d2, p2: p2, bw: bw, pw: pw });' +
         '})()');
       const hi = JSON.parse(hinfo);
       check('无根判定:红方无根=1', hi.hr.length === 1 && hi.hr[0][0] === 5 && hi.hr[0][1] === 4, JSON.stringify(hi.hr));
@@ -533,6 +535,8 @@ async function waitRejoined(i, n, budgetMs) {
       check('我的无根显示红色', hi.d1 === 1 && hi.d1c.indexOf(' r ') > 0 && hi.d1c.indexOf(' danger') > 0, hi.d1c);
       check('对方无根显示绿色', hi.p1 === 1, hi.p1);
       check('黑方视角红绿互换', hi.d2 === 1 && hi.p2 === 1, hi.d2 + '/' + hi.p2);
+      check('红环box-shadow生效', hi.bw.indexOf('255, 59, 48') >= 0, hi.bw);
+      check('绿环box-shadow生效', hi.pw.indexOf('46, 204, 113') >= 0, hi.pw);
     } catch (e) {
       check('无根棋子高亮', false, String(e));
     }

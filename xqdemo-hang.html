@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>running</title>
+<link rel="stylesheet" href="css/style.css">
+<style>
+  body { margin: 0; padding: 10px; }
+  #board { width: min(560px, calc(100vw - 20px)); margin: 0 auto; }
+</style>
+</head>
+<body>
+<div id="board" aria-label="棋盘">
+  <svg id="boardSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+  <div id="marks"></div>
+  <div id="pieces"></div>
+</div>
+<script src="js/rules.js"></script>
+<script src="js/ui.js"></script>
+<script>
+  UI.init({ onCellClick: function () {} });
+  var st = []; for (var r = 0; r < 10; r++) st.push(new Array(9).fill(null));
+  st[9][4] = { side: 'r', type: 'K' }; st[5][4] = { side: 'r', type: 'P' }; st[9][0] = { side: 'r', type: 'R' };
+  st[0][5] = { side: 'b', type: 'K' }; st[0][4] = { side: 'b', type: 'C' }; st[2][4] = { side: 'b', type: 'N' }; st[0][0] = { side: 'b', type: 'P' };
+  UI.setOrientation('r');
+  var q = (location.search.match(/sel=([\d,]+)/) || [])[1];
+  UI.render(st, { mySide: 'r', sel: q ? q.split(',').map(Number) : null });
+  window.__info = (function () {
+    var d = document.querySelector('.piece.danger'), p = document.querySelector('.piece.prey');
+    var cs = d ? getComputedStyle(d) : null;
+    return JSON.stringify({
+      danger: !!d, prey: !!p,
+      cls: d ? d.className : '',
+      outline: cs ? cs.outline : '',
+      outlineColor: cs ? cs.outlineColor : '',
+      outlineOffset: cs ? cs.outlineOffset : '',
+      borderRadius: cs ? cs.borderRadius : '',
+      w: cs ? cs.width : '', h: cs ? cs.height : '',
+      dpr: window.devicePixelRatio,
+      vw: window.innerWidth + 'x' + window.innerHeight
+    });
+  })();
+  document.title = 'DONE ' + window.__info;
+</script>
+</body></html>
