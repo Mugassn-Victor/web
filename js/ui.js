@@ -3,6 +3,16 @@
 
 const UI = (function () {
 
+  // 资源基址：由 ui.js 自身 src 推出站点根目录（页面在子目录时 mp3 也能命中）
+  const BASE = (function () {
+    try {
+      const s = document.currentScript ||
+        document.querySelector('script[src$="js/ui.js"]');
+      if (s && s.src) return s.src.replace(/js\/[^/]*$/, '');
+    } catch (e) { }
+    return '';
+  })();
+
   let orientation = 'r';          // 'r' 由下往上，'b' 翻转
   let onCellClick = null;
   let board = null, svg = null, marks = null, pieceLayer = null;
@@ -125,7 +135,7 @@ const UI = (function () {
   function sfxPreload(file) {
     try {
       if (!sfxEls[file]) {
-        const el = new Audio(file);
+        const el = new Audio(BASE + file);
         el.preload = 'auto';
         sfxEls[file] = el;
       }
@@ -199,7 +209,7 @@ const UI = (function () {
     if (bgmStarted) return;
     try {
       if (!bgm) {
-        bgm = new Audio('bg.mp3');
+        bgm = new Audio(BASE + 'bg.mp3');
         bgm.loop = true;
         bgm.volume = 0.35;
       }

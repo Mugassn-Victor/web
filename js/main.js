@@ -388,6 +388,12 @@
         toast('对方暂时不想重开');
         break;
       }
+      case 'chat': {
+        if (typeof msg.m === 'string' && msg.m) {
+          toast('对方: ' + msg.m.slice(0, 40), 4000);
+        }
+        break;
+      }
     }
   }
 
@@ -557,6 +563,21 @@
         { label: '留下', primary: true, onClick: closeModal }
       ]);
     };
+
+    // 聊天：发给对方、短暂显示、不留任何记录
+    function sendChat() {
+      const inp = $('chatInput');
+      const m = (inp.value || '').trim().slice(0, 40);
+      if (!m) return;
+      if (App.phase !== 'playing') { toast('对局开始后才能发送'); return; }
+      inp.value = '';
+      Net.send({ t: 'chat', m: m });
+      toast('我: ' + m, 4000);
+    }
+    $('btnSend').onclick = sendChat;
+    $('chatInput').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') sendChat();
+    });
 
     window.addEventListener('beforeunload', function () { Net.destroy(); });
 
