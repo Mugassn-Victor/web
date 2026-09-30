@@ -121,6 +121,7 @@ const UI = (function () {
   // mp3 音效播放器：落子声 chess.mp3（按文件缓存 Audio，可快速重播）
   const sfxEls = {};
   let sfxFile = '';
+  let sfxRate = 1;
   function sfxPreload(file) {
     try {
       if (!sfxEls[file]) {
@@ -130,16 +131,19 @@ const UI = (function () {
       }
     } catch (e) { /* 忽略 */ }
   }
-  function sfxPlay(file, vol) {
+  function sfxPlay(file, vol, rate) {
     try {
       let el = sfxEls[file];
       if (!el) { sfxPreload(file); el = sfxEls[file]; }
       if (!el) return;
       el.volume = vol == null ? 0.85 : vol;
+      el.playbackRate = rate || 1;
+      try { el.preservesPitch = true; el.webkitPreservesPitch = true; } catch (e) { /* 忽略 */ }
       try { if (el.currentTime > 0.05) el.currentTime = 0; } catch (e) { /* 忽略 */ }
       const p = el.play();
       if (p && p.catch) p.catch(function () { /* 被策略拦下，手势后自然可播 */ });
       sfxFile = file;
+      sfxRate = el.playbackRate;
     } catch (e) { /* 忽略 */ }
   }
   // 系统语音喊招（吃/将军），无 TTS 时静默降级为纯音效
@@ -160,6 +164,8 @@ const UI = (function () {
       return true;
     } catch (e) { return false; }
   }
+  // 语音类音效倍速：源文件念得慢，1.5 倍速 + 保音高（嫌快/慢改这里）
+  const VOICE_RATE = 1.5;
   const sound = {
     // 落子：chess.mp3 真实棋子声
     move: function () {
@@ -167,10 +173,10 @@ const UI = (function () {
     },
     // 吃子：eat.mp3（文件自带声音，不再叠 TTS）
     capture: function () {
-      sfxPlay('eat.mp3', 0.9);
+      sfxPlay('eat.mp3', 0.9, VOICE_RATE);
     },
     // 将军：jiangjun.mp3（文件自带声音，不再叠合成音/TTS）
-    check: function () { sfxPlay('jiangjun.mp3', 0.9); },
+    check: function () { sfxPlay('jiangjun.mp3', 0.9, VOICE_RATE); },
     win: function () { beep(523, 0.12, 'triangle', 0.24); beep(659, 0.12, 'triangle', 0.24, 0.13); beep(784, 0.2, 'triangle', 0.24, 0.26); },
     lose: function () { beep(440, 0.16, 'sawtooth', 0.20); beep(330, 0.24, 'sawtooth', 0.20, 0.17); },
     // 诊断：给 E2E / 排查用
@@ -179,6 +185,7 @@ const UI = (function () {
         ctx: actx ? actx.state : 'none',
         tts: !!(window.speechSynthesis && window.SpeechSynthesisUtterance),
         file: sfxFile,
+        rate: sfxRate,
         calls: speechCalls
       };
     },
