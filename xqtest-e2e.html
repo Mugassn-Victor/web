@@ -495,6 +495,7 @@ async function waitRejoined(i, n, budgetMs) {
         '  return Rules.legalMovesFrom(st, "r", 5, 4).some(function (m) { return m[0] === 5 && m[1] === 0; });' +
         '})()');
       check('吃子测试局面就绪', !!setupOk, String(setupOk));
+      const snd0 = JSON.parse(W(F).eval('JSON.stringify(UI.sound.state())'));
       cellClick(F, 5, 4);
       const selOk = selCount(F) === 1;
       cellClick(F, 5, 0);
@@ -502,6 +503,10 @@ async function waitRejoined(i, n, budgetMs) {
       const capA = W(F).eval('window.__cap'), mvA = W(F).eval('window.__mv');
       check('吃子只响吃子音效', selOk && capA === capB + 1 && mvA === mvB,
         'sel=' + selOk + ' cap=' + capB + '->' + capA + ' mv=' + mvB + '->' + mvA);
+      const snd1 = JSON.parse(W(F).eval('JSON.stringify(UI.sound.state())'));
+      check('吃子喊"吃"语音已触发', snd1.tts && snd1.calls === snd0.calls + 1,
+        JSON.stringify(snd0) + '->' + JSON.stringify(snd1));
+      check('音效上下文已创建', snd1.ctx !== 'none', snd1.ctx);
       W(F).eval('(function () { var s = App.__save; if (s) {' +
         'App.state = s.st; App.history = s.hist; App.phase = s.phase; App.sel = s.sel;' +
         'App.targets = s.tg; delete App.__save; } })()');
@@ -539,6 +544,15 @@ async function waitRejoined(i, n, budgetMs) {
       check('绿环box-shadow生效', hi.pw.indexOf('46, 204, 113') >= 0, hi.pw);
     } catch (e) {
       check('无根棋子高亮', false, String(e));
+    }
+
+    // ===== 11.9 背景音乐：进页面即挂上 bg.mp3 并循环 =====
+    try {
+      const bg = JSON.parse(W(0).eval('JSON.stringify(UI.bgm())'));
+      check('背景音乐已加载bg.mp3', !!bg && bg.src.indexOf('bg.mp3') >= 0, JSON.stringify(bg));
+      check('背景音乐循环播放', !!bg && bg.loop === true && bg.volume > 0, JSON.stringify(bg));
+    } catch (e) {
+      check('背景音乐', false, String(e));
     }
   }
 

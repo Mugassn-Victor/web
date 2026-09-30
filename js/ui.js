@@ -81,14 +81,29 @@ const UI = (function () {
 
   /* ---------- 音效 ---------- */
   let actx = null;
+  let speechCalls = 0;
   function ac() {
     if (!actx) {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return null;
       actx = new AC();
     }
-    if (actx.state === 'suspended') actx.resume();
+    if (actx.state === 'suspended' && actx.resume) actx.resume().catch(function () {});
     return actx;
+  }
+  // iOS/Safari 要求"用户手势内创建并启动"上下文，且要真的播一帧才解除挂起
+  function unlock() {
+    bgmPlay();
+    const c = ac();
+    if (!c) return;
+    if (c.state === 'suspended' && c.resume) c.resume().catch(function () {});
+    try {
+      const buf = c.createBuffer(1, 1, c.sampleRate);
+      const src = c.createBufferSource();
+      src.buffer = buf;
+      src.connect(c.destination);
+      src.start(0);
+    } catch (e) { /* 忽略：部分浏览器不允许静音帧 */ }
   }
   function beep(freq, dur, type, vol, delay) {
     const ctx = ac();
@@ -103,15 +118,68 @@ const UI = (function () {
     o.connect(g); g.connect(ctx.destination);
     o.start(t0); o.stop(t0 + dur + 0.02);
   }
+  // 系统语音喊招（吃/将军），无 TTS 时静默降级为纯音效
+  function speak(text) {
+    if (typeof window === 'undefined' || !window.speechSynthesis || !window.SpeechSynthesisUtterance) return false;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'zh-CN';
+      u.rate = 1.15;
+      u.pitch = 1;
+      const vs = window.speechSynthesis.getVoices() || [];
+      for (let i = 0; i < vs.length; i++) {
+        if (vs[i].lang && vs[i].lang.toLowerCase().indexOf('zh') === 0) { u.voice = vs[i]; break; }
+      }
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+      speechCalls++;
+      return true;
+    } catch (e) { return false; }
+  }
   const sound = {
     // 落棋：清脆一声"嗒"
-    move: function () { beep(660, 0.05, 'triangle', 0.16); beep(210, 0.09, 'sine', 0.14, 0.02); },
-    // 吃子：更重的"啪"+ 低音锤
-    capture: function () { beep(340, 0.09, 'square', 0.14); beep(140, 0.16, 'triangle', 0.16, 0.03); beep(880, 0.05, 'triangle', 0.10, 0.06); },
-    check: function () { beep(740, 0.09, 'square', 0.12); beep(740, 0.09, 'square', 0.12, 0.16); },
-    win: function () { beep(523, 0.12, 'triangle', 0.14); beep(659, 0.12, 'triangle', 0.14, 0.13); beep(784, 0.2, 'triangle', 0.14, 0.26); },
-    lose: function () { beep(440, 0.16, 'sawtooth', 0.10); beep(330, 0.24, 'sawtooth', 0.10, 0.17); }
+    move: function () { beep(880, 0.06, 'triangle', 0.30); beep(220, 0.10, 'sine', 0.26, 0.02); },
+    // 吃子：重"啪"+ 低音锤，再喊一声"吃"
+    capture: function () {
+      beep(340, 0.10, 'square', 0.30);
+      beep(140, 0.18, 'triangle', 0.30, 0.03);
+      beep(880, 0.06, 'triangle', 0.20, 0.07);
+      speak('吃');
+    },
+    check: function () { beep(740, 0.09, 'square', 0.22); beep(740, 0.09, 'square', 0.22, 0.16); speak('将军'); },
+    win: function () { beep(523, 0.12, 'triangle', 0.24); beep(659, 0.12, 'triangle', 0.24, 0.13); beep(784, 0.2, 'triangle', 0.24, 0.26); },
+    lose: function () { beep(440, 0.16, 'sawtooth', 0.20); beep(330, 0.24, 'sawtooth', 0.20, 0.17); },
+    // 诊断：给 E2E / 排查用
+    state: function () {
+      return {
+        ctx: actx ? actx.state : 'none',
+        tts: !!(window.speechSynthesis && window.SpeechSynthesisUtterance),
+        calls: speechCalls
+      };
+    },
+    unlock: unlock
   };
+
+  /* ---------- 背景音乐 ---------- */
+  let bgm = null;
+  let bgmStarted = false;
+  function bgmPlay() {
+    if (bgmStarted) return;
+    try {
+      if (!bgm) {
+        bgm = new Audio('bg.mp3');
+        bgm.loop = true;
+        bgm.volume = 0.35;
+      }
+      const p = bgm.play();
+      if (p && p.then) {
+        p.then(function () { bgmStarted = true; })
+         .catch(function () { /* 被自动播放策略拦下，等首次手势再试 */ });
+      } else {
+        bgmStarted = true;
+      }
+    } catch (e) { /* 忽略 */ }
+  }
 
   /* ---------- 初始化 ---------- */
   function init(opts) {
@@ -136,12 +204,17 @@ const UI = (function () {
     else window.addEventListener('resize', fitFont);
 
     // 音频需在首次用户手势时解锁，否则首次音效会被浏览器挂起吞掉
-    const unlock = function () {
-      const c = ac();
-      if (c && c.state === 'suspended' && c.resume) c.resume().catch(function () {});
-    };
     document.addEventListener('pointerdown', unlock, true);
+    document.addEventListener('touchend', unlock, true);
+    document.addEventListener('mousedown', unlock, true);
+    document.addEventListener('click', unlock, true);
     document.addEventListener('keydown', unlock, true);
+
+    // 预热中文语音列表（部分浏览器 voices 首次为空，需提前触发加载）
+    try { if (window.speechSynthesis) window.speechSynthesis.getVoices(); } catch (e) { }
+
+    // 进页面即尝试播背景音乐（被策略拦下时，上面首次手势会补播）
+    bgmPlay();
   }
 
   function setOrientation(side) {
@@ -276,6 +349,9 @@ const UI = (function () {
     clear: clear,
     fxCheck: fxCheck,
     fxFinish: fxFinish,
-    sound: sound
+    sound: sound,
+    bgm: function () {
+      return bgm ? { loop: bgm.loop, paused: bgm.paused, volume: bgm.volume, src: bgm.src } : null;
+    }
   };
 })();
