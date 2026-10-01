@@ -558,7 +558,7 @@
       btn.textContent = '挂断';
       mute.classList.add('hidden');
       sound.classList.add('hidden');
-      toast('正在呼叫对方…');
+      if (!v.silent) toast('正在呼叫对方…');
       return;
     }
     if (v.ev === 'talking') {

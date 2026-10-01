@@ -546,6 +546,11 @@ const Net = (function () {
     { urls: ['turn:turn.anyfirewall.com:3478', 'turn:turn.anyfirewall.com:443?transport=tcp'], username: 'guest', credential: 'guest' }
   ];
 
+  // 语音独立 ICE：游戏那套 + PeerJS 公共 TURN（跨网络时多一条中继路，失败率更低；不影响游戏）
+  const VICE = ICE.concat([
+    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' }
+  ]);
+
   let mpc = null;   // 手动/备用信令的 RTCPeerConnection
   let mdc = null;   // 对应的 DataChannel
 
@@ -783,23 +788,78 @@ const Net = (function () {
   }
 
   function hookVoicePc(pc) {
+    // talking 的判定：远端 track 到达 且 ICE 已连通（两个条件可能任意先后到达）
+    // —— ontrack 在 setRemote 阶段就会提前触发，不能一收到就报「通话中」
+    let gotTrack = false, iceUp = false, said = false;
+    function maybeTalking() {
+      if (said || vcall !== pc || !gotTrack || !iceUp) return;
+      said = true;
+      emit('voice', { ev: 'talking' });
+    }
     pc.ontrack = function (e) {
       if (vcall !== pc) return;
       const s = (e.streams && e.streams[0]) || new MediaStream(e.track ? [e.track] : []);
       playRemote(s);
-      emit('voice', { ev: 'talking' });
+      gotTrack = true;
+      maybeTalking();
     };
     pc.onconnectionstatechange = function () {
       if (vcall !== pc) return;
       const st = pc.connectionState;
-      if (st === 'failed') {
+      if (st === 'connected') {
+        iceUp = true;
+        maybeTalking();
+      } else if (st === 'failed') {
+        let p = null;
+        try { p = pc.getStats(); } catch (e) {}
         voiceCleanup();
-        emit('voice', { ev: 'idle', reason: 'err', msg: '语音连接失败' });
+        emitVoiceFail(p);
       } else if (st === 'closed') {
         voiceCleanup();
         emit('voice', { ev: 'idle', reason: 'closed' });
       }
     };
+  }
+
+  // 失败提示带上候选对类型（host/srflg/relay），一眼看出是哪条路没打通
+  function emitVoiceFail(p) {
+    let emitted = false;
+    const done = function (msg) {
+      if (emitted) return;
+      emitted = true;
+      tr('voice-fail ' + msg);
+      emit('voice', { ev: 'idle', reason: 'err', msg: msg });
+    };
+    const fallback = '语音连接失败（无可用网络路径）';
+    const t = setTimeout(function () { done(fallback); }, 2000);
+    if (!p || !p.then) { clearTimeout(t); done(fallback); return; }
+    p.then(function (rep) {
+      clearTimeout(t);
+      try {
+        const cand = {};
+        let nl = 0, nr = 0, sel = null;
+        if (rep && typeof rep.forEach === 'function') {
+          rep.forEach(function (r) {
+            if (r.type === 'local-candidate') { cand[r.id] = r; nl++; }
+            else if (r.type === 'remote-candidate') { cand[r.id] = r; nr++; }
+            else if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded')) { if (!sel) sel = r; }
+          });
+          if (rep.get && rep.get('selectedCandidatePairId')) {
+            const s = rep.get(rep.get('selectedCandidatePairId'));
+            if (s) sel = s;
+          }
+        }
+        if (sel && cand[sel.localCandidateId] && cand[sel.remoteCandidateId]) {
+          done('语音连接失败（' + (cand[sel.localCandidateId].candidateType || '?') + '↔' +
+            (cand[sel.remoteCandidateId].candidateType || '?') + '）');
+        } else {
+          done('语音连接失败（候选 ' + nl + '/' + nr + ' 未打通）');
+        }
+      } catch (e) { done(fallback); }
+    }).catch(function () {
+      clearTimeout(t);
+      done(fallback);
+    });
   }
 
   function getMic() {
@@ -818,7 +878,7 @@ const Net = (function () {
       }
       localStream = s;
       voiceMuted = false;
-      const pc = new RTCPeerConnection({ iceServers: ICE });
+      const pc = new RTCPeerConnection({ iceServers: VICE });
       hookVoicePc(pc);
       vcall = pc;
       vAnswered = false;
@@ -869,7 +929,7 @@ const Net = (function () {
       pendingCall = null;
       localStream = s;
       voiceMuted = false;
-      const pc = new RTCPeerConnection({ iceServers: ICE });
+      const pc = new RTCPeerConnection({ iceServers: VICE });
       hookVoicePc(pc);
       vcall = pc;
       vAnswered = false;
@@ -887,7 +947,8 @@ const Net = (function () {
           if (!sendV({ t: 'v-ans', sdp: sdp })) throw new Error('send');
           vAnswered = true;
           vRetransmit({ t: 'v-ans', sdp: sdp }, 2, function () { return vcall !== pc; });
-          emit('voice', { ev: 'talking' });
+          // 不要乐观报「通话中」：等 ontrack（媒体真到了）才算接通，否则会先显示通话中再弹连接失败
+          emit('voice', { ev: 'calling', silent: true });
         })
         .catch(function () {
           if (vcall !== pc) return;
@@ -951,6 +1012,24 @@ const Net = (function () {
     voiceHangup: voiceHangup,
     voiceMute: voiceMute,
     voiceMuteRemote: voiceMuteRemote,
+    _voiceDebug: function () {
+      return {
+        role: autoRole,
+        answered: vAnswered,
+        pending: !!pendingCall,
+        local: !!localStream,
+        pc: vcall ? {
+          cs: vcall.connectionState,
+          ice: vcall.iceConnectionState,
+          gath: vcall.iceGatheringState,
+          sig: vcall.signalingState,
+          senders: vcall.getSenders().length,
+          recv: vcall.getReceivers().map(function (r) {
+            return r.track ? (r.track.readyState + '/' + r.track.muted) : 'none';
+          })
+        } : null
+      };
+    },
     _trace: _trace
   };
 })();
