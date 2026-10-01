@@ -57,6 +57,7 @@ body {
 .sub { color: var(--muted); margin: 8px 0 28px; font-size: 13px; letter-spacing: 2px; }
 
 .lobby-actions { display: flex; flex-direction: column; gap: 14px; }
+.lobby-music { display: flex; justify-content: center; margin-top: 12px; }
 
 .btn {
   appearance: none;

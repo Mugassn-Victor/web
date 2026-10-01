@@ -206,8 +206,10 @@ const UI = (function () {
   /* ---------- 背景音乐 ---------- */
   let bgm = null;
   let bgmStarted = false;
+  let bgmOn = true;
+  try { bgmOn = localStorage.getItem('xqbgm') !== '0'; } catch (e) { /* 忽略 */ }
   function bgmPlay() {
-    if (bgmStarted) return;
+    if (!bgmOn || bgmStarted) return;
     try {
       if (!bgm) {
         bgm = new Audio(BASE + 'bg.mp3');
@@ -222,6 +224,22 @@ const UI = (function () {
         bgmStarted = true;
       }
     } catch (e) { /* 忽略 */ }
+  }
+
+  // 开关背景音乐（偏好存 localStorage），返回开启状态
+  function bgmToggle() {
+    bgmOn = !bgmOn;
+    try { localStorage.setItem('xqbgm', bgmOn ? '1' : '0'); } catch (e) { /* 忽略 */ }
+    if (!bgmOn) {
+      if (bgm) { try { bgm.pause(); } catch (e) { /* 忽略 */ } }
+      return false;
+    }
+    if (bgm && bgmStarted) {
+      try { const p = bgm.play(); if (p && p.catch) p.catch(function () {}); } catch (e) { /* 忽略 */ }
+      return true;
+    }
+    bgmPlay();
+    return bgmOn;
   }
 
   /* ---------- 初始化 ---------- */
@@ -399,7 +417,9 @@ const UI = (function () {
     fxFinish: fxFinish,
     sound: sound,
     bgm: function () {
-      return bgm ? { loop: bgm.loop, paused: bgm.paused, volume: bgm.volume, src: bgm.src } : null;
-    }
+      return bgm ? { loop: bgm.loop, paused: bgm.paused, volume: bgm.volume, src: bgm.src, on: bgmOn } : { on: bgmOn };
+    },
+    bgmOn: function () { return bgmOn; },
+    bgmToggle: bgmToggle
   };
 })();

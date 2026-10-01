@@ -442,7 +442,7 @@
     $('roomTag').textContent = '房间 ' + App.roomId;
     $('sideTag').textContent = sideName(side) + (side === RED ? '（先手）' : '（后手）');
     const ct = $('connTag');
-    ct.textContent = relay ? '中继连接' : '已连接';
+    ct.textContent = relay ? '中继连接' : '直连连接';
     ct.className = 'tag on';
     banner(null);
 
@@ -532,9 +532,14 @@
     if (btn) btn.disabled = !Net.voiceSupported();
   }
 
+  function renderBgm(on) {
+    const els = document.querySelectorAll('.btnBgm');
+    for (let i = 0; i < els.length; i++) els[i].textContent = on ? '关音乐' : '开音乐';
+  }
+
   function renderVoice(v) {
-    const st = $('voiceState'), btn = $('btnVoice'), mute = $('btnMute');
-    if (!st || !btn || !mute) return;
+    const st = $('voiceState'), btn = $('btnVoice'), mute = $('btnMute'), sound = $('btnSound');
+    if (!st || !btn || !mute || !sound) return;
 
     if (v.ev === 'ring') {
       modal('语音通话', '对方邀请语音通话', [
@@ -552,6 +557,7 @@
       st.textContent = '呼叫中…';
       btn.textContent = '挂断';
       mute.classList.add('hidden');
+      sound.classList.add('hidden');
       toast('正在呼叫对方…');
       return;
     }
@@ -562,11 +568,17 @@
       btn.textContent = '挂断';
       mute.classList.remove('hidden');
       mute.textContent = '静音';
+      sound.classList.remove('hidden');
+      sound.textContent = '静音对方';
       if (first) toast('语音已接通');
       return;
     }
     if (v.ev === 'muted') {
       mute.textContent = v.muted ? '取消静音' : '静音';
+      return;
+    }
+    if (v.ev === 'remote-muted') {
+      sound.textContent = v.muted ? '恢复声音' : '静音对方';
       return;
     }
     if (v.ev === 'idle') {
@@ -576,6 +588,8 @@
       btn.textContent = '语音通话';
       mute.classList.add('hidden');
       mute.textContent = '静音';
+      sound.classList.add('hidden');
+      sound.textContent = '静音对方';
       if (v.reason === 'err' && was !== 'idle') toast(v.msg || '语音连接失败');
       else if (v.reason === 'closed' && was === 'calling') toast('对方未接听');
       else if (v.reason === 'closed' && was === 'talking') toast('对方挂断了语音通话');
@@ -583,6 +597,17 @@
       return;
     }
     if (v.ev === 'err') {
+      // 呼出中途失败（offer 发送不出去等）要复位呼叫中状态，否则按钮一直卡在「挂断」
+      if (voiceUI === 'calling') {
+        voiceUI = 'idle';
+        st.textContent = '未通话';
+        btn.textContent = '语音通话';
+        mute.classList.add('hidden');
+        mute.textContent = '静音';
+        sound.classList.add('hidden');
+        sound.textContent = '静音对方';
+        refreshVoice();
+      }
       toast(v.msg || '语音通话出错');
       return;
     }
@@ -651,8 +676,16 @@
       else Net.voiceHangup();
     };
     $('btnMute').onclick = function () { Net.voiceMute(); };
+    $('btnSound').onclick = function () { Net.voiceMuteRemote(); };
     Net.on('voice', renderVoice);
     refreshVoice();
+
+    // 背景音乐开关（大厅与对局面板各一个，共享 class）
+    const bgmBtns = document.querySelectorAll('.btnBgm');
+    for (let i = 0; i < bgmBtns.length; i++) {
+      bgmBtns[i].onclick = function () { renderBgm(UI.bgmToggle()); };
+    }
+    renderBgm(UI.bgmOn());
 
     window.addEventListener('beforeunload', function () { Net.destroy(); });
 
@@ -717,13 +750,13 @@
     });
 
     // 对方重新加入（或直连恢复）：清掉断线状态，继续对局
-    Net.on('reconnected', function () {
+    Net.on('reconnected', function (info) {
       const wasOff = App.disconnected;
       App.disconnected = false;
       stopResumeRetry();
       banner(null);
       const ct = $('connTag');
-      ct.textContent = '已连接';
+      ct.textContent = (info && info.peer === 'relay') ? '中继连接' : '直连连接';
       ct.className = 'tag on';
       if ($('modalTitle').textContent === '对方掉线') closeModal();
       render();
