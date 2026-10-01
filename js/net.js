@@ -662,6 +662,25 @@ const Net = (function () {
       !dead && conn && conn.open);
   }
 
+  // 候选埋点：connectionState failed 后 getStats 里未配对的候选会被清掉（出现 0/0 假象），
+  // 这里在采集期就记下真实计数，供失败提示用
+  let vStat = null;
+
+  function voiceStatWire(pc) {
+    const st = { loc: 0, rel: 0, rem: 0 };
+    vStat = st;
+    pc.addEventListener('icecandidate', function (e) {
+      if (vcall !== pc || !e.candidate || !e.candidate.candidate) return;
+      st.loc++;
+      if (e.candidate.candidate.indexOf(' typ relay ') >= 0) st.rel++;
+    });
+  }
+
+  function voiceStatRemote(sdp) {
+    if (!vStat) return;
+    vStat.rem = String(sdp).split('\n').filter(function (l) { return l.indexOf('a=candidate') === 0; }).length;
+  }
+
   function sendV(o) {
     try { return !!send(o); } catch (e) { return false; }
   }
@@ -722,7 +741,9 @@ const Net = (function () {
       clearVRetry();
       clearVTimeout();
       const pc = vcall;
-      pc.setRemoteDescription({ type: 'answer', sdp: d.sdp }).catch(function () {
+      pc.setRemoteDescription({ type: 'answer', sdp: d.sdp })
+        .then(function () { voiceStatRemote(d.sdp); })
+        .catch(function () {
         if (vcall !== pc) return;
         voiceCleanup();
         emit('voice', { ev: 'idle', reason: 'err', msg: '语音连接失败' });
@@ -853,7 +874,10 @@ const Net = (function () {
           done('语音连接失败（' + (cand[sel.localCandidateId].candidateType || '?') + '↔' +
             (cand[sel.remoteCandidateId].candidateType || '?') + '）');
         } else {
-          done('语音连接失败（候选 ' + nl + '/' + nr + ' 未打通）');
+          const lc = vStat ? vStat.loc : nl;
+          const rc = vStat ? vStat.rem : nr;
+          const tail = (vStat && vStat.rel > 0) ? '，含relay ' + vStat.rel : '';
+          done('语音连接失败（本地候选' + lc + '、对端候选' + rc + tail + '）');
         }
       } catch (e) { done(fallback); }
     }).catch(function () {
@@ -878,8 +902,9 @@ const Net = (function () {
       }
       localStream = s;
       voiceMuted = false;
-      const pc = new RTCPeerConnection({ iceServers: VICE });
+      const pc = new RTCPeerConnection({ iceServers: VICE, __xqVoice: 1 });
       hookVoicePc(pc);
+      voiceStatWire(pc);
       vcall = pc;
       vAnswered = false;
       emit('voice', { ev: 'calling' });
@@ -929,12 +954,14 @@ const Net = (function () {
       pendingCall = null;
       localStream = s;
       voiceMuted = false;
-      const pc = new RTCPeerConnection({ iceServers: VICE });
+      const pc = new RTCPeerConnection({ iceServers: VICE, __xqVoice: 1 });
       hookVoicePc(pc);
+      voiceStatWire(pc);
       vcall = pc;
       vAnswered = false;
       pc.setRemoteDescription({ type: 'offer', sdp: offer.sdp })
         .then(function () {
+          voiceStatRemote(offer.sdp);
           // 必须在 createAnswer 前加音轨，否则 answer 方向变 recvonly，主叫收不到声音
           pc.addTrack(localStream.getAudioTracks()[0], localStream);
           return pc.createAnswer();
