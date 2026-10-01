@@ -706,17 +706,18 @@
     } catch (e) { return null; }
   }
 
-  /* ---- 聊天记录：文字 + 语音统一进 #chatLog，localStorage 按「房间:角色」存档 ---- */
+  /* ---- 聊天记录：全局只留一份存档，永远只有最近 3 条，开新房把旧的顶掉 ---- */
   let chatKey = null;
+  let chatRoom = null;
   let chatHist = [];
-  const CHAT_MAX = 100;   // 每份存档最多 100 条，超出挤掉最旧
+  const CHAT_MAX = 3;   // 只留最近 3 条，旧的被新的覆盖（文字语音合计）
 
   function chatStoreWrite() {
-    if (!chatKey) return;
+    if (!chatKey || !chatRoom) return;
     let arr = chatHist;
     for (let i = 0; i < 8 && arr.length; i++) {
       try {
-        localStorage.setItem(chatKey, JSON.stringify(arr));
+        localStorage.setItem(chatKey, JSON.stringify({ room: chatRoom, a: arr }));
         if (arr !== chatHist) { chatHist = arr; renderChatLog(); }
         return;
       } catch (e) {
@@ -728,12 +729,19 @@
     }
   }
 
-  function chatLoad() {
+  function chatLoad(room) {
     let a = [];
     try {
       const s = chatKey ? localStorage.getItem(chatKey) : null;
-      if (s) a = JSON.parse(s);
-      if (!Array.isArray(a)) a = [];
+      if (s) {
+        const o = JSON.parse(s);
+        // 只有同一个房间才恢复；换了房间就地删掉（开新房顶掉旧的）
+        if (o && typeof o === 'object' && !Array.isArray(o) && o.room === room && Array.isArray(o.a)) {
+          a = o.a;
+        } else if (chatKey) {
+          localStorage.removeItem(chatKey);
+        }
+      }
     } catch (e) { a = []; }
     if (a.length > CHAT_MAX) a = a.slice(-CHAT_MAX);
     for (let i = 0; i < a.length; i++) {
@@ -991,8 +999,16 @@
     });
 
     Net.on('connected', function (info) {
-      chatKey = 'xqchat:' + (App.roomId || '?') + ':' + (info.role || '?');
-      chatLoad();
+      // 全局一份存档：顺手清掉旧版按房间分的钥匙，永远只有 xqchat 一个键
+      try {
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+          const k = localStorage.key(i);
+          if (k && k.indexOf('xqchat') === 0 && k !== 'xqchat') localStorage.removeItem(k);
+        }
+      } catch (e) { }
+      chatKey = 'xqchat';
+      chatRoom = App.roomId || '';
+      chatLoad(chatRoom);
       startGame(sideForRole(info.role), !!info.relay);
       refreshVoice();
       // 请求棋谱：若对方是进行中的棋局（自己刚重新加入），会同步恢复局面

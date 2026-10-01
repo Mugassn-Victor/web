@@ -429,9 +429,11 @@ body {
 .chat input::placeholder { color: #6b5c48; letter-spacing: 1px; font-size: 13px; }
 .chat .btn { flex-shrink: 0; }
 
-/* 按住说话（语音消息） */
-.voice { display: flex; gap: 8px; align-items: center; }
-.voice span { flex: 1; color: var(--muted); font-size: 13px; }
+/* 按住说话（语音消息）：占满整行的长按钮，状态行只在录音/发送时出现 */
+.voice { display: flex; flex-direction: column; gap: 6px; }
+.voice .btn { width: 100%; }
+.voice span { color: var(--muted); font-size: 13px; text-align: center; }
+.voice span:empty { display: none; }
 .voice .btn:disabled { opacity: .45; cursor: default; }
 #btnVoice {
   touch-action: none;
