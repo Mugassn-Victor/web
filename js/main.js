@@ -448,6 +448,7 @@
 
     UI.setOrientation(side);
     render();
+    refreshVoice();
   }
 
   /* --- 加入房间倒计时 --- */
@@ -522,6 +523,71 @@
     location.reload();
   }
 
+  /* ================= 语音通话 ================= */
+
+  let voiceUI = 'idle';   // idle | calling | talking
+
+  function refreshVoice() {
+    const btn = $('btnVoice');
+    if (btn) btn.disabled = !Net.voiceSupported();
+  }
+
+  function renderVoice(v) {
+    const st = $('voiceState'), btn = $('btnVoice'), mute = $('btnMute');
+    if (!st || !btn || !mute) return;
+
+    if (v.ev === 'ring') {
+      modal('语音通话', '对方邀请语音通话', [
+        { label: '接听', primary: true, onClick: function () { closeModal(); Net.voiceAccept(); } },
+        { label: '拒绝', onClick: function () { closeModal(); Net.voiceDecline(); } }
+      ]);
+      return;
+    }
+    if (v.ev === 'ring-gone') {
+      if ($('modalTitle').textContent === '语音通话') closeModal();
+      return;
+    }
+    if (v.ev === 'calling') {
+      voiceUI = 'calling';
+      st.textContent = '呼叫中…';
+      btn.textContent = '挂断';
+      mute.classList.add('hidden');
+      toast('正在呼叫对方…');
+      return;
+    }
+    if (v.ev === 'talking') {
+      const first = voiceUI !== 'talking';
+      voiceUI = 'talking';
+      st.textContent = '通话中';
+      btn.textContent = '挂断';
+      mute.classList.remove('hidden');
+      mute.textContent = '静音';
+      if (first) toast('语音已接通');
+      return;
+    }
+    if (v.ev === 'muted') {
+      mute.textContent = v.muted ? '取消静音' : '静音';
+      return;
+    }
+    if (v.ev === 'idle') {
+      const was = voiceUI;
+      voiceUI = 'idle';
+      st.textContent = '未通话';
+      btn.textContent = '语音通话';
+      mute.classList.add('hidden');
+      mute.textContent = '静音';
+      if (v.reason === 'err' && was !== 'idle') toast(v.msg || '语音连接失败');
+      else if (v.reason === 'closed' && was === 'calling') toast('对方未接听');
+      else if (v.reason === 'closed' && was === 'talking') toast('对方挂断了语音通话');
+      refreshVoice();
+      return;
+    }
+    if (v.ev === 'err') {
+      toast(v.msg || '语音通话出错');
+      return;
+    }
+  }
+
   /* ================= 事件绑定 ================= */
 
   function bind() {
@@ -579,6 +645,15 @@
       if (e.key === 'Enter') sendChat();
     });
 
+    // 语音通话：拨出/挂断一个键，静音单独一键；呼入走接听弹窗
+    $('btnVoice').onclick = function () {
+      if (voiceUI === 'idle') Net.voiceStart();
+      else Net.voiceHangup();
+    };
+    $('btnMute').onclick = function () { Net.voiceMute(); };
+    Net.on('voice', renderVoice);
+    refreshVoice();
+
     window.addEventListener('beforeunload', function () { Net.destroy(); });
 
     /* --- 网络事件 --- */
@@ -589,10 +664,12 @@
         $('hostPanel').classList.remove('hidden');
         lobbyStatus('');
       }
+      refreshVoice();
     });
 
     Net.on('connected', function (info) {
       startGame(sideForRole(info.role), !!info.relay);
+      refreshVoice();
       // 请求棋谱：若对方是进行中的棋局（自己刚重新加入），会同步恢复局面
       Net.send({ t: 'sync-req' });
       // 公共 broker 是 QoS0，sync-req 偶发丢失会让棋谱永远空着 → 恢复前重试

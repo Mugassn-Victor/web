@@ -22,6 +22,14 @@ const Net = (function () {
   let pendingData = [];     // 连接建立前收到的消息，先缓存
   const handlers = {};
 
+  /* 语音通话状态（PeerJS MediaConnection） */
+  let vcall = null;         // 进行中的呼出/已接通通话
+  let pendingCall = null;   // 对方呼入，等待接听
+  let localStream = null;   // 本机麦克风
+  let vAudio = null;        // 播放对方声音的 audio 元素
+  let remoteVid = null;     // 对方 PeerJS id（数据通道里交换）
+  let voiceMuted = false;
+
   const P2P_WAIT = 10000;   // 信令交换完成后等 P2P 的时间
   const HB_INT = 3000;      // 心跳间隔
   const HB_MAX = 12000;     // 超过这个时间没收到任何消息 → 对方已断
@@ -45,6 +53,14 @@ const Net = (function () {
   }
 
   function deliver(d) {
+    // 语音对端 id 交换：网络层内部消息，不上抛给对局层
+    if (d && typeof d === 'object' && d.t === 'vid') {
+      if (typeof d.id === 'string' && d.id && (!peer || d.id !== peer.id)) {
+        remoteVid = d.id;
+        tr('vid ' + d.id);
+      }
+      return;
+    }
     if (!settled) { pendingData.push(d); return; }
     emit('data', d);
   }
@@ -71,6 +87,7 @@ const Net = (function () {
         tr('fire-upgrade role=' + role);
         emit('reconnected', { role: role, peer: (c && c.peer) || 'p2p', upgraded: lateP2P });
         flush();
+        syncVid();
         return;
       }
       try { c.close(); } catch (e) {}
@@ -84,6 +101,7 @@ const Net = (function () {
     tr('fire-first role=' + role + ' relay=' + !!(c && c._relay));
     emit('connected', { role: role, peer: (c && c.peer) || 'p2p' });
     flush();
+    syncVid();
   }
 
   function setupConn(c, role) {
@@ -161,6 +179,7 @@ const Net = (function () {
     startHb();
     emit('connected', { role: role, peer: 'relay', relay: true });
     flush();
+    syncVid();
   }
 
   function makeRelayWrap() {
@@ -231,10 +250,30 @@ const Net = (function () {
   function newPeer(id) {
     if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
     peer = new Peer(id);
-    peer.on('open', function (myId) { emit('open', myId); });
+    peer.on('open', function (myId) { emit('open', myId); syncVid(); });
     peer.on('error', function (e) { emit('error', e); });
     peer.on('disconnected', function () {
       try { peer.reconnect(); } catch (e) {}
+    });
+    // 对方拨入语音：弹接听框（iOS 要求手势内取麦克风，故必须点「接听」而非自动接）
+    peer.on('call', function (c) {
+      if (dead) { try { c.close(); } catch (e) {} return; }
+      if (vcall) {
+        // 双方同时呼入的撞车：房主的呼叫胜出，客方撤回自己的并接听
+        if (autoRole === 'host') { try { c.close(); } catch (e) {} return; }
+        try { vcall.close(); } catch (e) {}
+        vcall = null;
+        stopLocalStream();
+        clearRemote();
+        voiceMuted = false;
+        emit('voice', { ev: 'idle', reason: 'glare' });
+      }
+      if (pendingCall) { try { c.close(); } catch (e) {} return; }
+      pendingCall = c;
+      c.on('close', function () {
+        if (pendingCall === c) { pendingCall = null; emit('voice', { ev: 'ring-gone' }); }
+      });
+      emit('voice', { ev: 'ring' });
     });
     return peer;
   }
@@ -280,6 +319,8 @@ const Net = (function () {
 
   function destroy() {
     dead = true;
+    voiceCleanup();
+    remoteVid = null;
     stopMqttSig();
     clearP2pTimer();
     clearHb();
@@ -631,6 +672,179 @@ const Net = (function () {
       });
   }
 
+  /* ===== 语音通话：PeerJS MediaConnection，与数据联机共用信令 ===== */
+
+  function syncVid() {
+    if (peer && peer.id && settled) send({ t: 'vid', id: peer.id });
+  }
+
+  function voiceSupported() {
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia &&
+      window.isSecureContext && peer && !peer.destroyed && !peer.disconnected &&
+      peer.id && typeof peer.call === 'function');
+  }
+
+  function voiceRemoteId() {
+    if (remoteVid) return remoteVid;
+    if (conn && conn.peer && conn.peer !== 'relay' &&
+        String(conn.peer).indexOf('manual-') !== 0 && conn.peer !== peer.id) return conn.peer;
+    if (autoRole === 'guest' && lastRoom) return lastRoom;   // 房主的 PeerJS id = 房间号
+    return null;
+  }
+
+  function stopLocalStream() {
+    if (localStream) {
+      try { localStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+      localStream = null;
+    }
+  }
+
+  function playRemote(stream) {
+    try {
+      if (!vAudio) {
+        vAudio = document.createElement('audio');
+        vAudio.autoplay = true;
+        document.body.appendChild(vAudio);
+        // 手势解锁后重试播放（iOS 可能在流到达时仍缺用户手势）
+        window.__vAudioPlay = function () {
+          if (!vAudio) return;
+          const p = vAudio.play();
+          if (p && p.catch) p.catch(function () {});
+        };
+      }
+      vAudio.srcObject = stream;
+      const p = vAudio.play();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) { /* 忽略 */ }
+  }
+
+  function clearRemote() {
+    if (vAudio) { try { vAudio.pause(); } catch (e) {} vAudio.srcObject = null; }
+    try { if (window) window.__vAudioPlay = undefined; } catch (e) {}
+  }
+
+  function voiceCleanup() {
+    try { if (vcall) vcall.close(); } catch (e) {}
+    try { if (pendingCall) pendingCall.close(); } catch (e) {}
+    vcall = null;
+    pendingCall = null;
+    stopLocalStream();
+    clearRemote();
+    voiceMuted = false;
+  }
+
+  function hookVoice(c) {
+    c.on('stream', function (rs) { playRemote(rs); emit('voice', { ev: 'talking' }); });
+    c.on('close', function () {
+      if (vcall === c) {
+        vcall = null;
+        stopLocalStream();
+        clearRemote();
+        voiceMuted = false;
+        emit('voice', { ev: 'idle', reason: 'closed' });
+      } else if (pendingCall === c) {
+        pendingCall = null;
+        emit('voice', { ev: 'ring-gone' });
+      }
+    });
+    c.on('error', function () {
+      if (vcall === c) {
+        vcall = null;
+        stopLocalStream();
+        clearRemote();
+        voiceMuted = false;
+        emit('voice', { ev: 'idle', reason: 'err', msg: '语音连接失败' });
+      }
+    });
+  }
+
+  function getMic() {
+    return navigator.mediaDevices.getUserMedia({ audio: true });
+  }
+
+  function voiceStart() {
+    if (!voiceSupported()) { emit('voice', { ev: 'err', msg: '当前环境不支持语音通话' }); return; }
+    const rid = voiceRemoteId();
+    if (!rid) { emit('voice', { ev: 'err', msg: '对方暂时无法通话，请稍后再试' }); return; }
+    getMic().then(function (s) {
+      if (!voiceSupported() || vcall) {
+        try { s.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+        if (vcall) emit('voice', { ev: 'err', msg: '已在通话中' });
+        return;
+      }
+      localStream = s;
+      voiceMuted = false;
+      const c = peer.call(rid, s);
+      if (!c) {
+        stopLocalStream();
+        emit('voice', { ev: 'err', msg: '发起通话失败' });
+        return;
+      }
+      vcall = c;
+      hookVoice(c);
+      emit('voice', { ev: 'calling' });
+    }).catch(function (e) {
+      emit('voice', {
+        ev: 'err',
+        msg: (e && e.name === 'NotAllowedError') ? '麦克风权限被拒绝' : '无法打开麦克风'
+      });
+    });
+  }
+
+  function voiceAccept() {
+    const c = pendingCall;
+    if (!c) return;
+    if (!voiceSupported() || !navigator.mediaDevices) {
+      pendingCall = null;
+      try { c.close(); } catch (e) {}
+      emit('voice', { ev: 'err', msg: '当前环境不支持语音通话' });
+      emit('voice', { ev: 'ring-gone' });
+      return;
+    }
+    getMic().then(function (s) {
+      if (pendingCall !== c) { try { s.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} return; }
+      pendingCall = null;
+      localStream = s;
+      voiceMuted = false;
+      try { c.answer(s); } catch (e) {
+        stopLocalStream();
+        try { c.close(); } catch (e2) {}
+        emit('voice', { ev: 'err', msg: '接听失败' });
+        return;
+      }
+      vcall = c;
+      hookVoice(c);
+      emit('voice', { ev: 'talking' });
+    }).catch(function () {
+      // 麦克风拿不到就无法通话：挂掉呼入并提示
+      if (pendingCall === c) pendingCall = null;
+      try { c.close(); } catch (e) {}
+      emit('voice', { ev: 'ring-gone' });
+      emit('voice', { ev: 'err', msg: '麦克风不可用，无法接听' });
+    });
+  }
+
+  function voiceDecline() {
+    const c = pendingCall;
+    pendingCall = null;
+    try { if (c) c.close(); } catch (e) {}
+    emit('voice', { ev: 'ring-gone' });
+  }
+
+  function voiceHangup() {
+    const active = !!(vcall || pendingCall || localStream);
+    voiceCleanup();
+    if (active) emit('voice', { ev: 'idle', reason: 'local' });
+  }
+
+  function voiceMute() {
+    if (!localStream) return false;
+    voiceMuted = !voiceMuted;
+    localStream.getAudioTracks().forEach(function (t) { t.enabled = !voiceMuted; });
+    emit('voice', { ev: 'muted', muted: voiceMuted });
+    return voiceMuted;
+  }
+
   return {
     on: on,
     create: create,
@@ -640,6 +854,12 @@ const Net = (function () {
     isConnected: isConnected,
     signalingPending: signalingPending,
     resume: resume,
+    voiceSupported: voiceSupported,
+    voiceStart: voiceStart,
+    voiceAccept: voiceAccept,
+    voiceDecline: voiceDecline,
+    voiceHangup: voiceHangup,
+    voiceMute: voiceMute,
     _trace: _trace
   };
 })();

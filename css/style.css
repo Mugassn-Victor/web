@@ -428,6 +428,11 @@ body {
 .chat input::placeholder { color: #6b5c48; letter-spacing: 1px; font-size: 13px; }
 .chat .btn { flex-shrink: 0; }
 
+/* 语音通话 */
+.voice { display: flex; gap: 8px; align-items: center; }
+.voice span { flex: 1; color: var(--muted); font-size: 13px; }
+.voice .btn:disabled { opacity: .45; cursor: default; }
+
 .banner {
   position: fixed;
   left: 50%;

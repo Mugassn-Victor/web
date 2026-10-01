@@ -104,6 +104,7 @@ const UI = (function () {
   // iOS/Safari 要求"用户手势内创建并启动"上下文，且要真的播一帧才解除挂起
   function unlock() {
     bgmPlay();
+    try { if (window.__vAudioPlay) window.__vAudioPlay(); } catch (e) { /* 忽略 */ }
     const c = ac();
     if (!c) return;
     if (c.state === 'suspended' && c.resume) c.resume().catch(function () {});
