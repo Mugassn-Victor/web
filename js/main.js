@@ -394,6 +394,23 @@
         }
         break;
       }
+      case 'vmsg': {
+        if (typeof msg.b === 'string' && msg.b) {
+          Net.send({ t: 'vak', k: msg.k });   // 先确认（尽力而为，对方超时会重发）
+          recvVoiceMsg(msg);
+        }
+        break;
+      }
+      case 'vak': {
+        const w = vmsgWait[msg.k];
+        if (w) {
+          clearTimeout(w.t);
+          delete vmsgWait[msg.k];
+          if (pttState === 'sending') setPttState('idle');
+          toast('语音已发送');
+        }
+        break;
+      }
     }
   }
 
@@ -523,13 +540,211 @@
     location.reload();
   }
 
-  /* ================= 语音通话 ================= */
+  /* ================= 语音消息：按住说话 ================= */
+  // 录音 → base64 骑对局通道发给对方 → 对方回 ACK 确认；不依赖 WebRTC 媒体与任何云
 
-  let voiceUI = 'idle';   // idle | calling | talking
+  const PTT_MAX = 15000;   // 单条最长 15 秒，到点自动停
+  const PTT_MIN = 400;     // 短于 0.4 秒视为误触，不发送
+  const PTT_ACK = 3000;    // 等 ACK 超时，超时重发一次
+
+  let pttStream = null;    // 麦克风流
+  let pttRec = null;       // 进行中的 MediaRecorder
+  let pttHeld = false;     // 按键是否按住
+  let pttStart = 0;
+  let pttTickT = null;     // 录音秒数刷新
+  let pttMaxT = null;      // 15 秒封顶
+  let pttState = 'idle';   // idle | recording | sending
+  let vmsgSeq = 0;
+  const vmsgWait = {};     // 发送中等 ACK 的条目 k → { t, n }
+  const vmsgSeen = [];     // 收过的 k（防重发重复渲染）
+
+  function pttSupported() {
+    return !!(window.isSecureContext && navigator.mediaDevices &&
+      navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+  }
 
   function refreshVoice() {
     const btn = $('btnVoice');
-    if (btn) btn.disabled = !Net.voiceSupported();
+    if (btn) btn.disabled = !(pttSupported() && Net.isConnected());
+  }
+
+  function setPttState(s) {
+    pttState = s;
+    const st = $('voiceState'), btn = $('btnVoice');
+    if (st) st.textContent = (s === 'recording') ? '录音中…' : (s === 'sending') ? '发送中…' : '';
+    if (btn) {
+      btn.textContent = (s === 'recording') ? '松开发送' : '按住说话';
+      btn.classList.toggle('rec', s === 'recording');
+    }
+    refreshVoice();
+  }
+
+  function pttTick() {
+    const st = $('voiceState');
+    if (st && pttState === 'recording') {
+      st.textContent = '录音中 ' + ((Date.now() - pttStart) / 1000).toFixed(1) + '″';
+    }
+  }
+
+  function pttPickMime() {
+    const list = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+    if (window.MediaRecorder.isTypeSupported) {
+      for (let i = 0; i < list.length; i++) {
+        if (MediaRecorder.isTypeSupported(list[i])) return list[i];
+      }
+    }
+    return '';
+  }
+
+  function pttDown() {
+    if (pttHeld || pttState !== 'idle' || !pttSupported()) return;
+    pttHeld = true;
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) {
+      if (!pttHeld || pttState !== 'idle') {   // 松手太快，gUM 才返回 → 不录
+        s.getTracks().forEach(function (t) { t.stop(); });
+        return;
+      }
+      let rec;
+      try {
+        const mime = pttPickMime();
+        rec = mime ? new MediaRecorder(s, { mimeType: mime, audioBitsPerSecond: 16000 }) : new MediaRecorder(s);
+      } catch (err) {
+        s.getTracks().forEach(function (t) { t.stop(); });
+        pttHeld = false;
+        toast('此浏览器不支持语音录制');
+        return;
+      }
+      pttStream = s;
+      pttRec = rec;
+      const chunks = [];
+      rec.ondataavailable = function (ev) { if (ev.data && ev.data.size) chunks.push(ev.data); };
+      rec.onstop = function () { pttDone(rec, chunks); };
+      pttStart = Date.now();
+      setPttState('recording');
+      rec.start();
+      pttTickT = setInterval(pttTick, 200);
+      pttMaxT = setTimeout(pttUp, PTT_MAX);
+      if (navigator.vibrate) { try { navigator.vibrate(20); } catch (err) {} }
+    }).catch(function () {
+      pttHeld = false;
+      toast('无法打开麦克风（权限被拒绝？）');
+    });
+  }
+
+  function pttUp() {
+    if (!pttHeld) return;
+    pttHeld = false;
+    if (pttTickT) { clearInterval(pttTickT); pttTickT = null; }
+    if (pttMaxT) { clearTimeout(pttMaxT); pttMaxT = null; }
+    const rec = pttRec;
+    if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch (e) {} }
+    if (!rec) setPttState('idle');   // gUM 还没返回就没录上
+  }
+
+  function pttDone(rec, chunks) {
+    const dur = Date.now() - pttStart;
+    if (pttStream) { try { pttStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} }
+    pttStream = null;
+    if (pttRec === rec) pttRec = null;
+    setPttState('idle');
+    if (dur < PTT_MIN) { toast('说话时间太短'); return; }
+    const blob = new Blob(chunks, { type: (rec.mimeType || '').split(';')[0] || 'audio/webm' });
+    if (!blob.size) { toast('录音失败，请重试'); return; }
+    sendVoiceMsg(blob, dur);
+  }
+
+  function blobToB64(blob, cb) {
+    const fr = new FileReader();
+    fr.onload = function () {
+      const u = new Uint8Array(fr.result);
+      let s = '';
+      for (let i = 0; i < u.length; i += 0x8000) {
+        s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+      }
+      try { cb(btoa(s)); } catch (e) { cb(null); }
+    };
+    fr.onerror = function () { cb(null); };
+    fr.readAsArrayBuffer(blob);
+  }
+
+  function sendVoiceMsg(blob, dur) {
+    if (!Net.isConnected()) { toast('连接断开，语音未发送'); return; }
+    setPttState('sending');
+    blobToB64(blob, function (b64) {
+      if (!b64) { setPttState('idle'); toast('录音读取失败'); return; }
+      const k = (Date.now() % 1e9) + '.' + (++vmsgSeq);
+      const payload = { t: 'vmsg', k: k, d: Math.round(dur), m: blob.type, b: b64 };
+      sendWithAck(k, payload, 0);
+    });
+  }
+
+  function sendWithAck(k, payload, n) {
+    if (!Net.send(payload)) { vmsgFail(); return; }
+    const w = { n: n };
+    w.t = setTimeout(function () {
+      delete vmsgWait[k];
+      if (w.n < 1) sendWithAck(k, payload, 1);
+      else vmsgFail();
+    }, PTT_ACK);
+    vmsgWait[k] = w;
+  }
+
+  function vmsgFail() {
+    setPttState('idle');
+    toast('语音发送失败');
+  }
+
+  function recvVoiceMsg(msg) {
+    if (vmsgSeen.indexOf(msg.k) >= 0) return;   // 重发造成的重复：只回过 ACK，不再渲染
+    vmsgSeen.push(msg.k);
+    if (vmsgSeen.length > 30) vmsgSeen.shift();
+    const box = $('voiceMsgs');
+    if (!box) return;
+    let blob = null;
+    try {
+      const bin = atob(msg.b);
+      const u = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+      blob = new Blob([u], { type: msg.m || 'application/octet-stream' });
+    } catch (e) { return; }
+    window.__vmsgLast = { bytes: blob.size, d: msg.d || 0, m: msg.m };
+
+    box.classList.remove('hidden');
+    while (box.children.length >= 3) {   // 最多留 3 条，旧的挤掉
+      const old = box.firstChild;
+      if (old._url) { try { URL.revokeObjectURL(old._url); } catch (e) {} }
+      box.removeChild(old);
+    }
+    const row = document.createElement('div');
+    row.className = 'vmsg';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'vmsg-play';
+    btn.textContent = '▶';
+    const lab = document.createElement('span');
+    lab.className = 'vmsg-dur';
+    lab.textContent = Math.max(1, Math.round((msg.d || 0) / 1000)) + '″';
+    row.appendChild(btn);
+    row.appendChild(lab);
+    box.appendChild(row);
+
+    row._url = URL.createObjectURL(blob);
+    const audio = new Audio(row._url);
+    window.__vmsgAudio = audio;
+    audio.onended = function () { btn.textContent = '▶'; window.__vmsgPlaying = false; };
+    function play() {
+      const p = audio.play();
+      if (p && p.then) {
+        p.then(function () { btn.textContent = '■'; window.__vmsgPlaying = true; })
+          .catch(function () { btn.textContent = '点此播放'; window.__vmsgPlaying = false; });
+      } else { btn.textContent = '■'; window.__vmsgPlaying = true; }
+    }
+    btn.onclick = function () {
+      if (audio.paused) play();
+      else { audio.pause(); btn.textContent = '▶'; window.__vmsgPlaying = false; }
+    };
+    // 桌面通常自动播放成功；手机浏览器会拒绝，留个按钮让用户点
+    if (!window.__vmsgPlaying) play(); else btn.textContent = '▶';
   }
 
   function renderBgm(on) {
@@ -537,81 +752,6 @@
     for (let i = 0; i < els.length; i++) els[i].textContent = on ? '关音乐' : '开音乐';
   }
 
-  function renderVoice(v) {
-    const st = $('voiceState'), btn = $('btnVoice'), mute = $('btnMute'), sound = $('btnSound');
-    if (!st || !btn || !mute || !sound) return;
-
-    if (v.ev === 'ring') {
-      modal('语音通话', '对方邀请语音通话', [
-        { label: '接听', primary: true, onClick: function () { closeModal(); Net.voiceAccept(); } },
-        { label: '拒绝', onClick: function () { closeModal(); Net.voiceDecline(); } }
-      ]);
-      return;
-    }
-    if (v.ev === 'ring-gone') {
-      if ($('modalTitle').textContent === '语音通话') closeModal();
-      return;
-    }
-    if (v.ev === 'calling') {
-      voiceUI = 'calling';
-      st.textContent = '呼叫中…';
-      btn.textContent = '挂断';
-      mute.classList.add('hidden');
-      sound.classList.add('hidden');
-      if (!v.silent) toast('正在呼叫对方…');
-      return;
-    }
-    if (v.ev === 'talking') {
-      const first = voiceUI !== 'talking';
-      voiceUI = 'talking';
-      st.textContent = '通话中';
-      btn.textContent = '挂断';
-      mute.classList.remove('hidden');
-      mute.textContent = '静音';
-      sound.classList.remove('hidden');
-      sound.textContent = '静音对方';
-      if (first) toast('语音已接通');
-      return;
-    }
-    if (v.ev === 'muted') {
-      mute.textContent = v.muted ? '取消静音' : '静音';
-      return;
-    }
-    if (v.ev === 'remote-muted') {
-      sound.textContent = v.muted ? '恢复声音' : '静音对方';
-      return;
-    }
-    if (v.ev === 'idle') {
-      const was = voiceUI;
-      voiceUI = 'idle';
-      st.textContent = '未通话';
-      btn.textContent = '语音通话';
-      mute.classList.add('hidden');
-      mute.textContent = '静音';
-      sound.classList.add('hidden');
-      sound.textContent = '静音对方';
-      if (v.reason === 'err' && was !== 'idle') toast(v.msg || '语音连接失败');
-      else if (v.reason === 'closed' && was === 'calling') toast('对方未接听');
-      else if (v.reason === 'closed' && was === 'talking') toast('对方挂断了语音通话');
-      refreshVoice();
-      return;
-    }
-    if (v.ev === 'err') {
-      // 呼出中途失败（offer 发送不出去等）要复位呼叫中状态，否则按钮一直卡在「挂断」
-      if (voiceUI === 'calling') {
-        voiceUI = 'idle';
-        st.textContent = '未通话';
-        btn.textContent = '语音通话';
-        mute.classList.add('hidden');
-        mute.textContent = '静音';
-        sound.classList.add('hidden');
-        sound.textContent = '静音对方';
-        refreshVoice();
-      }
-      toast(v.msg || '语音通话出错');
-      return;
-    }
-  }
 
   /* ================= 事件绑定 ================= */
 
@@ -670,15 +810,21 @@
       if (e.key === 'Enter') sendChat();
     });
 
-    // 语音通话：拨出/挂断一个键，静音单独一键；呼入走接听弹窗
-    $('btnVoice').onclick = function () {
-      if (voiceUI === 'idle') Net.voiceStart();
-      else Net.voiceHangup();
-    };
-    $('btnMute').onclick = function () { Net.voiceMute(); };
-    $('btnSound').onclick = function () { Net.voiceMuteRemote(); };
-    Net.on('voice', renderVoice);
-    refreshVoice();
+    // 按住说话：按下开录、松开发送；键盘 Space/Enter 等价
+    const vbtn = $('btnVoice');
+    if (vbtn) {
+      vbtn.addEventListener('pointerdown', function (e) { e.preventDefault(); pttDown(); });
+      vbtn.addEventListener('keydown', function (e) {
+        if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); pttDown(); }
+      });
+      vbtn.addEventListener('keyup', function (e) {
+        if (e.key === ' ' || e.key === 'Enter') pttUp();
+      });
+      window.addEventListener('pointerup', pttUp);
+      window.addEventListener('pointercancel', pttUp);
+      window.addEventListener('blur', pttUp);
+      refreshVoice();
+    }
 
     // 背景音乐开关（大厅与对局面板各一个，共享 class）
     const bgmBtns = document.querySelectorAll('.btnBgm');
