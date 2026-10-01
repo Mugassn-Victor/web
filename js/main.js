@@ -390,22 +390,23 @@
       }
       case 'chat': {
         if (typeof msg.m === 'string' && msg.m) {
-          toast('对方: ' + msg.m.slice(0, 40), 4000);
+          chatAppend({ x: 't', s: 'them', m: msg.m, ts: Date.now() }, false);
         }
         break;
       }
       case 'vmsg': {
         if (typeof msg.b === 'string' && msg.b) {
-          Net.send({ t: 'vak', k: msg.k });   // 先确认（尽力而为，对方超时会重发）
+          Net.send({ t: 'vak', id: msg.id });   // 先确认（尽力而为，对方超时会重发）
           recvVoiceMsg(msg);
         }
         break;
       }
       case 'vak': {
-        const w = vmsgWait[msg.k];
+        const w = vmsgWait[msg.id];
         if (w) {
           clearTimeout(w.t);
-          delete vmsgWait[msg.k];
+          delete vmsgWait[msg.id];
+          vmsgSetState(msg.id, '');
           if (pttState === 'sending') setPttState('idle');
           toast('语音已发送');
         }
@@ -672,21 +673,23 @@
     setPttState('sending');
     blobToB64(blob, function (b64) {
       if (!b64) { setPttState('idle'); toast('录音读取失败'); return; }
-      const k = (Date.now() % 1e9) + '.' + (++vmsgSeq);
-      const payload = { t: 'vmsg', k: k, d: Math.round(dur), m: blob.type, b: b64 };
-      sendWithAck(k, payload, 0);
+      const id = (Date.now() % 1e9) + '.' + (++vmsgSeq);
+      const entry = { x: 'v', s: 'me', id: id, b: b64, mt: blob.type, d: Math.round(dur), ts: Date.now(), st: 's' };
+      chatAppend(entry, false);
+      const payload = { t: 'vmsg', id: id, d: entry.d, m: blob.type, b: b64 };
+      sendWithAck(id, payload, 0);
     });
   }
 
-  function sendWithAck(k, payload, n) {
-    if (!Net.send(payload)) { vmsgFail(); return; }
+  function sendWithAck(id, payload, n) {
+    if (!Net.send(payload)) { vmsgSetState(id, 'x'); vmsgFail(); return; }
     const w = { n: n };
     w.t = setTimeout(function () {
-      delete vmsgWait[k];
-      if (w.n < 1) sendWithAck(k, payload, 1);
-      else vmsgFail();
+      delete vmsgWait[id];
+      if (w.n < 1) sendWithAck(id, payload, 1);
+      else { vmsgSetState(id, 'x'); vmsgFail(); }
     }, PTT_ACK);
-    vmsgWait[k] = w;
+    vmsgWait[id] = w;
   }
 
   function vmsgFail() {
@@ -694,57 +697,198 @@
     toast('语音发送失败');
   }
 
-  function recvVoiceMsg(msg) {
-    if (vmsgSeen.indexOf(msg.k) >= 0) return;   // 重发造成的重复：只回过 ACK，不再渲染
-    vmsgSeen.push(msg.k);
-    if (vmsgSeen.length > 30) vmsgSeen.shift();
-    const box = $('voiceMsgs');
-    if (!box) return;
-    let blob = null;
+  function b64ToBlob(b64, mt) {
     try {
-      const bin = atob(msg.b);
+      const bin = atob(b64);
       const u = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-      blob = new Blob([u], { type: msg.m || 'application/octet-stream' });
-    } catch (e) { return; }
-    window.__vmsgLast = { bytes: blob.size, d: msg.d || 0, m: msg.m };
+      return new Blob([u], { type: mt || 'application/octet-stream' });
+    } catch (e) { return null; }
+  }
 
+  /* ---- 聊天记录：文字 + 语音统一进 #chatLog，localStorage 按「房间:角色」存档 ---- */
+  let chatKey = null;
+  let chatHist = [];
+  const CHAT_MAX = 100;   // 每份存档最多 100 条，超出挤掉最旧
+
+  function chatStoreWrite() {
+    if (!chatKey) return;
+    let arr = chatHist;
+    for (let i = 0; i < 8 && arr.length; i++) {
+      try {
+        localStorage.setItem(chatKey, JSON.stringify(arr));
+        if (arr !== chatHist) { chatHist = arr; renderChatLog(); }
+        return;
+      } catch (e) {
+        // 空间不够：先挤掉最旧的语音条目（体积大）
+        let idx = 0;
+        for (let j = 0; j < arr.length; j++) { if (arr[j].x === 'v') { idx = j; break; } }
+        arr = arr.slice(idx + 1);
+      }
+    }
+  }
+
+  function chatLoad() {
+    let a = [];
+    try {
+      const s = chatKey ? localStorage.getItem(chatKey) : null;
+      if (s) a = JSON.parse(s);
+      if (!Array.isArray(a)) a = [];
+    } catch (e) { a = []; }
+    if (a.length > CHAT_MAX) a = a.slice(-CHAT_MAX);
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] && a[i].st === 's') a[i].st = 'x';   // 上次没等到 ACK 的条目 → 标为发送失败
+    }
+    chatHist = a;
+    renderChatLog();
+  }
+
+  function chatAppend(e, fresh) {
+    chatHist.push(e);
+    const box = $('chatLog');
+    if (box) {
+      box.classList.remove('hidden');
+      while (chatHist.length > CHAT_MAX) {
+        const old = chatHist.shift();
+        const fr = box.firstChild;
+        if (fr && fr._url) { try { URL.revokeObjectURL(fr._url); } catch (er) {} }
+        if (fr) box.removeChild(fr);
+        if (old && old.x === 'v' && old.id) {
+          const j = vmsgSeen.indexOf(old.id);
+          if (j >= 0) vmsgSeen.splice(j, 1);
+        }
+      }
+      box.appendChild(chatRow(e, fresh));
+      box.scrollTop = box.scrollHeight;
+    } else {
+      while (chatHist.length > CHAT_MAX) chatHist.shift();
+    }
+    chatStoreWrite();
+  }
+
+  function renderChatLog() {
+    const box = $('chatLog');
+    if (!box) return;
+    while (box.firstChild) {
+      const fr = box.firstChild;
+      if (fr._url) { try { URL.revokeObjectURL(fr._url); } catch (e) {} }
+      box.removeChild(fr);
+    }
+    if (!chatHist.length) { box.classList.add('hidden'); return; }
     box.classList.remove('hidden');
-    while (box.children.length >= 3) {   // 最多留 3 条，旧的挤掉
-      const old = box.firstChild;
-      if (old._url) { try { URL.revokeObjectURL(old._url); } catch (e) {} }
-      box.removeChild(old);
-    }
-    const row = document.createElement('div');
-    row.className = 'vmsg';
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'vmsg-play';
-    btn.textContent = '▶';
-    const lab = document.createElement('span');
-    lab.className = 'vmsg-dur';
-    lab.textContent = Math.max(1, Math.round((msg.d || 0) / 1000)) + '″';
-    row.appendChild(btn);
-    row.appendChild(lab);
-    box.appendChild(row);
+    for (let i = 0; i < chatHist.length; i++) box.appendChild(chatRow(chatHist[i], false));
+    box.scrollTop = box.scrollHeight;
+  }
 
-    row._url = URL.createObjectURL(blob);
-    const audio = new Audio(row._url);
-    window.__vmsgAudio = audio;
-    audio.onended = function () { btn.textContent = '▶'; window.__vmsgPlaying = false; };
-    function play() {
-      const p = audio.play();
-      if (p && p.then) {
-        p.then(function () { btn.textContent = '■'; window.__vmsgPlaying = true; })
-          .catch(function () { btn.textContent = '点此播放'; window.__vmsgPlaying = false; });
-      } else { btn.textContent = '■'; window.__vmsgPlaying = true; }
+  function chatTime(ts) {
+    const d = new Date(ts || Date.now());
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function chatRow(e, fresh) {
+    const row = document.createElement('div');
+    row.className = (e.x === 'v') ? 'vmsg' : 'msg';
+    if (e.id) row.setAttribute('data-id', e.id);
+    const from = document.createElement('span');
+    from.className = 'from';
+    from.textContent = (e.s === 'me') ? '我: ' : '对方: ';
+    row.appendChild(from);
+    if (e.x === 'v') {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'vmsg-play';
+      btn.textContent = '▶';
+      const dur = document.createElement('span');
+      dur.className = 'vmsg-dur';
+      dur.textContent = Math.max(1, Math.round((e.d || 0) / 1000)) + '″';
+      row.appendChild(btn);
+      row.appendChild(dur);
+      if (e.st) {
+        const st = document.createElement('span');
+        st.className = 'vmsg-st';
+        st.textContent = (e.st === 'x') ? '发送失败' : '发送中…';
+        row.appendChild(st);
+      }
+      let audio = null;
+      function ensure() {
+        if (!audio) {
+          const blob = b64ToBlob(e.b, e.mt);
+          if (!blob) return null;
+          row._url = URL.createObjectURL(blob);
+          window.__vmsgLast = { bytes: blob.size, d: e.d || 0, m: e.mt };
+          audio = new Audio(row._url);
+          window.__vmsgAudio = audio;
+          audio.onended = function () { btn.textContent = '▶'; window.__vmsgPlaying = false; };
+        }
+        return audio;
+      }
+      function play() {
+        const a = ensure();
+        if (!a) return;
+        const p = a.play();
+        if (p && p.then) {
+          p.then(function () { btn.textContent = '■'; window.__vmsgPlaying = true; })
+            .catch(function () { btn.textContent = '点此播放'; window.__vmsgPlaying = false; });
+        } else { btn.textContent = '■'; window.__vmsgPlaying = true; }
+      }
+      btn.onclick = function () {
+        const a = ensure();
+        if (!a) return;
+        if (a.paused) play();
+        else { a.pause(); btn.textContent = '▶'; window.__vmsgPlaying = false; }
+      };
+      // 只有刚收到的新消息尝试自动播放；历史条目一律等用户点
+      if (fresh && e.s === 'them') {
+        if (!window.__vmsgPlaying) play(); else btn.textContent = '▶';
+      }
+    } else {
+      const tx = document.createElement('span');
+      tx.className = 'txt';
+      tx.textContent = e.m || '';
+      row.appendChild(tx);
     }
-    btn.onclick = function () {
-      if (audio.paused) play();
-      else { audio.pause(); btn.textContent = '▶'; window.__vmsgPlaying = false; }
-    };
-    // 桌面通常自动播放成功；手机浏览器会拒绝，留个按钮让用户点
-    if (!window.__vmsgPlaying) play(); else btn.textContent = '▶';
+    const ts = document.createElement('span');
+    ts.className = 'ts';
+    ts.textContent = chatTime(e.ts);
+    row.appendChild(ts);
+    return row;
+  }
+
+  function vmsgSetState(id, st) {
+    for (let i = 0; i < chatHist.length; i++) {
+      const e = chatHist[i];
+      if (e.x === 'v' && e.id === id) { e.st = st || ''; break; }
+    }
+    const box = $('chatLog');
+    const row = box ? box.querySelector('[data-id="' + id + '"]') : null;
+    if (row) {
+      let sp = row.querySelector('.vmsg-st');
+      if (!st) { if (sp && sp.parentNode) sp.parentNode.removeChild(sp); }
+      else {
+        if (!sp) {
+          sp = document.createElement('span');
+          sp.className = 'vmsg-st';
+          const tsel = row.querySelector('.ts');
+          row.insertBefore(sp, tsel || null);
+        }
+        sp.textContent = (st === 'x') ? '发送失败' : '发送中…';
+      }
+    }
+    chatStoreWrite();
+  }
+
+  function recvVoiceMsg(msg) {
+    const id = msg.id;
+    if (!id || !msg.b) return;
+    if (vmsgSeen.indexOf(id) >= 0) return;   // 重发造成的重复：ACK 已回，不再入账
+    for (let i = 0; i < chatHist.length; i++) {
+      const e = chatHist[i];
+      if (e.x === 'v' && e.id === id) { vmsgSeen.push(id); return; }   // 存档里已有
+    }
+    vmsgSeen.push(id);
+    if (vmsgSeen.length > 30) vmsgSeen.shift();
+    chatAppend({ x: 'v', s: 'them', id: id, b: msg.b, mt: msg.m, d: msg.d || 0, ts: Date.now(), st: '' }, true);
   }
 
   function renderBgm(on) {
@@ -795,7 +939,7 @@
       ]);
     };
 
-    // 聊天：发给对方、短暂显示、不留任何记录
+    // 聊天：发给对方、双方进历史记录（不弹窗），本地存档刷新后还在
     function sendChat() {
       const inp = $('chatInput');
       const m = (inp.value || '').trim().slice(0, 40);
@@ -803,7 +947,7 @@
       if (App.phase !== 'playing') { toast('对局开始后才能发送'); return; }
       inp.value = '';
       Net.send({ t: 'chat', m: m });
-      toast('我: ' + m, 4000);
+      chatAppend({ x: 't', s: 'me', m: m, ts: Date.now() }, false);
     }
     $('btnSend').onclick = sendChat;
     $('chatInput').addEventListener('keydown', function (e) {
@@ -847,6 +991,8 @@
     });
 
     Net.on('connected', function (info) {
+      chatKey = 'xqchat:' + (App.roomId || '?') + ':' + (info.role || '?');
+      chatLoad();
       startGame(sideForRole(info.role), !!info.relay);
       refreshVoice();
       // 请求棋谱：若对方是进行中的棋局（自己刚重新加入），会同步恢复局面

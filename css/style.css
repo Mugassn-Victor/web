@@ -445,8 +445,26 @@ body {
   color: #fff;
 }
 
-/* 收到的语音消息条 */
-.vmsgs { display: flex; flex-direction: column; gap: 8px; }
+/* 聊天记录（文字 + 语音消息） */
+.chatlog {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.msg {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.msg .from { color: var(--muted); flex-shrink: 0; }
+.msg .txt { color: var(--accent); }
+.ts { margin-left: auto; color: #6b5c48; font-size: 11px; flex-shrink: 0; }
+
 .vmsg {
   display: flex;
   gap: 10px;
@@ -467,6 +485,7 @@ body {
   cursor: pointer;
 }
 .vmsg-dur { color: var(--muted); font-size: 13px; }
+.vmsg-st { color: var(--red-bright); font-size: 12px; }
 
 .banner {
   position: fixed;
