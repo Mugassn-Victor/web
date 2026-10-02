@@ -19,12 +19,15 @@ const Net = (function () {
   let peerGone = false;     // 心跳超时判对方掉线后置位；对方消息再到达时复活心跳并报重连
   let lastPunch = 0;        // 中继模式下背景打洞的节流
   let relayWanted = false;
+  let beaconWanted = false;  // 房主开局后要广播观战信标
+  let peerSid = null;        // 对方的总线 sid（只认它的心跳判活，观战者不算对方）
   let pendingData = [];     // 连接建立前收到的消息，先缓存
   const handlers = {};
 
   const P2P_WAIT = 10000;   // 信令交换完成后等 P2P 的时间
   const HB_INT = 3000;      // 心跳间隔
   const HB_MAX = 12000;     // 超过这个时间没收到任何消息 → 对方已断
+  const WATCH_TIMEOUT = 10000;   // 观战等房主信标的时限
 
   const _trace = [];
   function tr(evt) {
@@ -158,7 +161,7 @@ const Net = (function () {
     conn = makeRelayWrap();
     clearP2pTimer();
     peerGone = false;
-    startHb();
+    if (role !== 'watch') startHb();   // 观战没有对端可测活，不发心跳
     emit('connected', { role: role, peer: 'relay', relay: true });
     flush();
   }
@@ -174,12 +177,15 @@ const Net = (function () {
     };
   }
 
-  function busSend(o) {
+  function busSend(o, mir) {
     if (!busReady()) { tr('send-skip nobus ' + (o && o.t)); return false; }
     try {
       tr('send ' + (o && o.t));
       // 带上自己的 sid：broker 会把消息回给发布者本人，收端靠 sid 过滤掉自己发的
-      mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'm', d: o, sid: mqttSig.sid }));
+      // mir=1 是直连模式的镜像副本：只给观战者收听，对局方收到会丢弃（他们已从直连拿到）
+      const pkt = { k: 'm', d: o, sid: mqttSig.sid };
+      if (mir) pkt.mir = 1;
+      mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify(pkt));
       return true;
     } catch (e) { tr('send-err ' + e); return false; }
   }
@@ -245,6 +251,7 @@ const Net = (function () {
     settled = false;
     autoRole = 'host';
     lastRoom = roomId;
+    peerSid = null;
     pendingData = [];
     startMqttSig(roomId, 'host');
     if (typeof Peer === 'undefined') return;
@@ -258,6 +265,7 @@ const Net = (function () {
     settled = false;
     autoRole = 'guest';
     lastRoom = roomId;
+    peerSid = null;
     pendingData = [];
     startMqttSig(roomId, 'guest');
     if (typeof Peer === 'undefined') return;
@@ -269,17 +277,55 @@ const Net = (function () {
     });
   }
 
+  // 观战：只挂总线收听 + 发言，不建 Peer、不打洞；见房主信标后入房
+  function watch(roomId) {
+    dead = false;
+    settled = false;
+    autoRole = 'watch';
+    lastRoom = roomId;
+    peerSid = null;
+    pendingData = [];
+    startMqttSig(roomId, 'watch');
+  }
+
+  // 房主开局后广播信标（k:'w'）：观战者靠它确认「房间正在对局」
+  function beacon(on) {
+    beaconWanted = !!on;
+    armBeacon();
+  }
+
+  function armBeacon() {
+    if (!beaconWanted || !mqttSig || mqttSig.beaconT || !mqttSig.mq) return;
+    const st = mqttSig;
+    const fire = function () {
+      if (st.done || !beaconWanted || mqttSig !== st || !st.mq || !st.mq._opened) return;
+      try { st.mq.publish(st.topic, JSON.stringify({ k: 'w', sid: st.sid })); } catch (e) {}
+    };
+    fire();
+    st.beaconT = setInterval(fire, 3000);
+  }
+
   function send(obj) {
     if (conn && conn.open) {
-      try { conn.send(obj); return true; } catch (e) {}
+      if (conn._relay) return conn.send(obj);   // 中继/观战：走总线，天然广播给观战者
+      let ok = false;
+      try { conn.send(obj); ok = true; } catch (e) {}
+      if (ok) {
+        // 直连通道只到对局双方：镜像一份到总线供观战者收听（对局方收到镜像会丢弃）
+        if (autoRole !== 'watch') busSend(obj, true);
+        return true;
+      }
+      // 直连抛错 → 总线兜底投递（不带镜像标记：这条就是真正的投递）
+      if (busReady()) return busSend(obj, false);
+      return false;
     }
-    // P2P 通道不可用但中继在 → 走中继
-    if (conn && !conn._relay && busReady()) return busSend(obj);
+    if (autoRole === 'watch' && busReady()) return busSend(obj, false);
     return false;
   }
 
   function destroy() {
     dead = true;
+    beaconWanted = false;
     stopMqttSig();
     clearP2pTimer();
     clearHb();
@@ -287,6 +333,7 @@ const Net = (function () {
     const c = conn;
     conn = null;
     settled = false;
+    peerSid = null;
     manualClose();
     try { if (c) c.close(); } catch (e) {}
     try { if (peer) peer.destroy(); } catch (e) {}
@@ -337,6 +384,8 @@ const Net = (function () {
     st.done = true;
     st.timers.forEach(function (id) { clearInterval(id); });
     st.timers = [];
+    if (st.beaconT) { clearInterval(st.beaconT); st.beaconT = null; }
+    if (st.watchT) { clearTimeout(st.watchT); st.watchT = null; }
     try { if (st.mq) st.mq.close(); } catch (e) {}
     st.mq = null;
   }
@@ -351,7 +400,8 @@ const Net = (function () {
     const st = {
       mq: null, topic: topic, sid: sid, timers: [],
       offer: null, answer: null, answering: false, accepted: false, done: false,
-      lastOffer: null, lastEnsure: 0, ensuring: false, offerTimer: null, ensureOffer: null
+      lastOffer: null, lastEnsure: 0, ensuring: false, offerTimer: null, ensureOffer: null,
+      beaconT: null, watchT: null
     };
     mqttSig = st;
 
@@ -364,12 +414,31 @@ const Net = (function () {
       // 中继模式下也继续发布：供背景打洞的 offer/answer 交换用
       if (st.offer && !st.done && (!settled || (conn && conn._relay))) pub({ k: 'o', sd: st.offer, sid: st.sid });
     };
+    // 观战：收到房里任何人的消息即确认房间存在 → 入房
+    const watchFound = function () {
+      if (st.done || dead) return;
+      if (st.watchT) { clearTimeout(st.watchT); st.watchT = null; }
+      if (settled) return;
+      tr('watch-found');
+      relayConnect('watch');
+    };
 
     mq.onopen = function () {
       if (st.done) return;
       tr('mq-open role=' + role);
       mq.subscribe(topic);
       mq.subscribe(dataTopic);
+      if (role === 'watch') {
+        // 观战：等房主信标（或任何房内消息）确认「房间在开局」，超时放弃
+        st.watchT = setTimeout(function () {
+          if (st.done || settled || dead) return;
+          tr('watch-miss timeout');
+          stopMqttSig();
+          emit('watch-miss');
+        }, WATCH_TIMEOUT);
+        return;
+      }
+      if (beaconWanted) armBeacon();   // 房主（含总线重建后）恢复观战信标
       if (relayWanted && !settled) { relayWanted = false; relayConnect(autoRole || 'guest'); return; }
       if (settled) {
         // 总线重建后房主仍处于中继/掉线兜底状态 → 补发 offer 等对方接回
@@ -442,20 +511,35 @@ const Net = (function () {
         // 自己的 undo-ok/restart-ok 会被自己再执行一遍）
         if (m && m.k === 'hb') tr(m.sid === st.sid ? 'hb-own' : 'hb-r');
         if (m && m.sid === st.sid) return;
-        lastHb = Date.now();
+        // 只认对局对方的心跳 sid 来判活：观战者不发心跳，其消息不能顶替对方在线
+        if (m && m.k === 'hb') peerSid = m.sid;
+        const fromPeer = !peerSid || (m && m.sid === peerSid);
+        if (fromPeer) lastHb = Date.now();
         // 对方掉线被判死后，收到对方消息 = 对方已回来：复活自己的心跳（否则对方等不到
         // 我方 hb 也会超时互判掉线），并向上报重连以清理断线状态/弹窗
-        if (peerGone) {
+        if (peerGone && (autoRole === 'watch' || fromPeer)) {
           peerGone = false;
           tr('hb-revive');
-          startHb();
+          if (autoRole !== 'watch') startHb();
           emit('reconnected', { role: autoRole, peer: 'relay' });
         }
+        if (role === 'watch') watchFound();   // 收到房内消息即入房
+        if (m && m.mir && autoRole !== 'watch') return;   // 直连镜像只给观战者，对局方丢弃
         if (m && m.k === 'm' && m.d !== undefined) { tr('recv ' + (m.d && m.d.t)); deliver(m.d); }
         return;
       }
       if (t !== topic) return;
       if (!m || m.sid === st.sid) return;
+      if (role === 'watch') {
+        watchFound();
+        // 总线重建后的复活：房主信标也算「对方回来了」（直连房主平时不发心跳）
+        if (peerGone && settled) {
+          peerGone = false;
+          tr('hb-revive-topic');
+          emit('reconnected', { role: autoRole, peer: 'relay' });
+        }
+        return;
+      }
       if (m.k === 'j') {
         // 客方敲门 = 总线已就位：房主立刻先中继连上（不等打洞），并回 'hi' 让客方也连上
         if (role === 'host') {
@@ -508,7 +592,8 @@ const Net = (function () {
       tr('mq-close settled=' + settled + ' relay=' + !!(conn && conn._relay));
       if (mqttSig === st) st.mq = null;   // 总线已断，允许 resume 重建
       if (mqttSig !== st) return;
-      if (settled && conn && conn._relay) { clearHb(); emit('closed'); return; }
+      if (role === 'watch' && !settled) { stopMqttSig(); emit('watch-miss'); return; }
+      if (settled && conn && conn._relay) { clearHb(); peerGone = true; emit('closed'); return; }
       if (!st.done && !settled) stopMqttSig();
     };
     mq.connect();
@@ -635,6 +720,8 @@ const Net = (function () {
     on: on,
     create: create,
     join: join,
+    watch: watch,
+    beacon: beacon,
     send: send,
     destroy: destroy,
     isConnected: isConnected,

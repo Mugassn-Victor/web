@@ -480,7 +480,49 @@ const Rules = (function () {
     return done();
   }
 
-  // ===== 无根棋子：被对方攻击且己方无子护卫（将帅不计） =====
+  // ===== 无根棋子：被对方「真能」吃、且己方「真能」吃回才算有根 =====
+  // 吃与回都要求走完后自己不被将军（含将帅照面）—— 钉死的假攻、假根一律不算
+  function canCapture(state, bySide, tr, tc) {
+    for (let r = 0; r < 10; r++) {
+      for (let c = 0; c < 9; c++) {
+        const p = state[r][c];
+        if (!p || p.side !== bySide) continue;
+        const ms = pseudoMoves(state, r, c, p);
+        let can = false;
+        for (let i = 0; i < ms.length; i++) {
+          if (ms[i][0] === tr && ms[i][1] === tc) { can = true; break; }
+        }
+        if (!can) continue;
+        const ns = clone(state);
+        ns[tr][tc] = ns[r][c];
+        ns[r][c] = null;
+        if (!inCheck(ns, bySide)) return true;
+      }
+    }
+    return false;
+  }
+
+  // 将/帅能否吃回照将子（在照将子的落点上吃掉它）
+  function kingDefended(state, side) {
+    const k = findKing(state, side);
+    if (!k) return false;
+    const enemy = side === RED ? BLACK : RED;
+    for (let r = 0; r < 10; r++) {
+      for (let c = 0; c < 9; c++) {
+        const p = state[r][c];
+        if (!p || p.side !== enemy) continue;
+        const ms = pseudoMoves(state, r, c, p);
+        for (let i = 0; i < ms.length; i++) {
+          if (ms[i][0] === k[0] && ms[i][1] === k[1]) {
+            if (canCapture(state, side, r, c)) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  // 伪攻击预筛（省得每格都做合法性检验）
   function attackSet(state, bySide) {
     const s = new Set();
     for (let r = 0; r < 10; r++) {
@@ -502,27 +544,22 @@ const Rules = (function () {
       const side = sides[si];
       const enemy = side === RED ? BLACK : RED;
       const eAtk = attackSet(state, enemy);
-      const dummy = { side: enemy, type: 'P' };
       for (let r = 0; r < 10; r++) {
         for (let c = 0; c < 9; c++) {
           const p = state[r][c];
-          if (!p || p.side !== side || p.type === 'K') continue;
-          if (!eAtk.has(r * 9 + c)) continue;
-          // 换成敌方假子后，己方对其落点的攻击即"护卫"（含炮架判定）
-          state[r][c] = dummy;
-          let def = false;
-          for (let rr = 0; rr < 10 && !def; rr++) {
-            for (let cc = 0; cc < 9 && !def; cc++) {
-              const q = state[rr][cc];
-              if (!q || q.side !== side) continue;
-              const ms = pseudoMoves(state, rr, cc, q);
-              for (let i = 0; i < ms.length; i++) {
-                if (ms[i][0] === r && ms[i][1] === c) { def = true; break; }
-              }
-            }
+          if (!p || p.side !== side) continue;
+          if (p.type === 'K') {
+            // 将/帅：被将军（含照面，与 .check 同口径）且无法吃回照将子 → 无根
+            if (inCheck(state, side) && !kingDefended(state, side)) res[side].push([r, c]);
+            continue;
           }
-          state[r][c] = p;
-          if (!def) res[side].push([r, c]);
+          if (!eAtk.has(r * 9 + c)) continue;
+          if (!canCapture(state, enemy, r, c)) continue;   // 钉死的攻方吃不到
+          // 换成敌方假子站上该格，己方能否合法吃回（钉死/照面假根剔除）
+          const dummy = { side: enemy, type: 'P' };
+          const bd = clone(state);
+          bd[r][c] = dummy;
+          if (!canCapture(bd, side, r, c)) res[side].push([r, c]);
         }
       }
     }

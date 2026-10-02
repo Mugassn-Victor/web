@@ -12,7 +12,9 @@
     mySide: null,
     swapped: false,      // 再来一局后红黑是否已互换（刷新页面后由 sync 标记恢复）
     roomId: null,
-    mode: null,         // 'host' | 'guest'
+    mode: null,         // 'host' | 'guest' | 'watch'
+    watch: false,       // 观战模式：只读棋盘，可聊天/语音
+    watchNick: '',      // 观战昵称：每次进房前现填，不存本机
     phase: 'lobby',     // lobby | playing | over
     sel: null,
     targets: [],
@@ -198,6 +200,17 @@
     };
     const reason = reasonMap[stt.reason] || '对局结束';
     render();
+    if (App.watch) {
+      // 观战：没有胜负感，只报结果
+      const show = function () {
+        modal('对局结束', reason + '\n' + sideName(winner) + '获胜',
+          [{ label: '返回大厅', onClick: leaveToLobby }]);
+      };
+      if (stt.reason === 'checkmate') { UI.fxFinish((pattern || '绝杀').replace(/、/g, ' ').split('').join(' ')); setTimeout(show, 800); }
+      else if (stt.reason === 'stalemate') { UI.fxFinish('困 毙'); setTimeout(show, 800); }
+      else show();
+      return;
+    }
     if (winner === App.mySide) UI.sound.win(); else UI.sound.lose();
     const showModal = function () {
       modal(winner === App.mySide ? '胜利' : '失败',
@@ -221,6 +234,11 @@
   function forceOver(winner, reason) {
     App.phase = 'over';
     render();
+    if (App.watch) {
+      modal('对局结束', reason + '\n' + sideName(winner) + '获胜',
+        [{ label: '返回大厅', onClick: leaveToLobby }]);
+      return;
+    }
     if (winner === App.mySide) UI.sound.win(); else UI.sound.lose();
     modal(winner === App.mySide ? '胜利' : '失败',
       reason + '\n' + sideName(winner) + '获胜',
@@ -248,7 +266,7 @@
     App.pendingUndo = false;
     recompute();
     render();
-    toast('悔棋成功，退回上一步');
+    if (!App.watch) toast('悔棋成功，退回上一步');
   }
 
   function requestRestart() {
@@ -276,8 +294,12 @@
 
   /* ================= 消息 ================= */
 
+  // 观战方只处理这些：悔棋/重开请求类弹窗不打扰观众（走棋与同步照常收）
+  const WATCH_OK = ['move', 'sync', 'chat', 'vmsg', 'vak', 'undo-ok', 'restart-ok', 'resign'];
+
   function onMessage(msg) {
     if (!msg || typeof msg !== 'object') return;
+    if (App.watch && WATCH_OK.indexOf(msg.t) < 0) return;
     switch (msg.t) {
       case 'move': {
         if (App.disconnected || App.phase !== 'playing') { Net.send({ t: 'sync-req' }); return; }
@@ -306,7 +328,7 @@
         const longer = msg.hist.length > App.history.length;
         const diff = msg.hist.length === App.history.length &&
           JSON.stringify(msg.hist) !== JSON.stringify(App.history);
-        if (!longer && !diff) return;
+        if (!longer && !diff && !App.watch) return;
         App.history = msg.hist;
         App.sel = null;
         App.targets = [];
@@ -352,6 +374,11 @@
       }
       case 'resign': {
         if (App.phase === 'over') return;
+        if (App.watch) {
+          const loser = (msg.sd === RED || msg.sd === BLACK) ? msg.sd : currentTurn();
+          forceOver(loser === RED ? BLACK : RED, sideName(loser) + '认输');
+          return;
+        }
         forceOver(App.mySide, '对方认输');
         break;
       }
@@ -390,7 +417,9 @@
       }
       case 'chat': {
         if (typeof msg.m === 'string' && msg.m) {
-          chatAppend({ x: 't', s: 'them', m: msg.m, ts: Date.now() }, false);
+          const e = { x: 't', s: 'them', sd: msg.sd, m: msg.m, ts: Date.now() };
+          if (typeof msg.nm === 'string' && msg.nm) e.nm = msg.nm;
+          chatAppend(e, false);
         }
         break;
       }
@@ -438,6 +467,7 @@
   }
 
   function flipSide() {
+    if (App.watch) return;   // 观战方没有自己的红黑
     App.mySide = App.mySide === RED ? BLACK : RED;
     $('sideTag').textContent = sideName(App.mySide) + (App.mySide === RED ? '（先手）' : '（后手）');
     UI.setOrientation(App.mySide);
@@ -445,7 +475,7 @@
 
   function startGame(side, relay) {
     stopWait();
-    App.mySide = side;
+    App.mySide = App.watch ? null : side;
     App.history = [];
     App.phase = 'playing';
     App.sel = null;
@@ -458,14 +488,26 @@
     $('lobby').classList.add('hidden');
     $('game').classList.remove('hidden');
     $('roomTag').textContent = '房间 ' + App.roomId;
-    $('sideTag').textContent = sideName(side) + (side === RED ? '（先手）' : '（后手）');
+    if (App.watch) {
+      $('sideTag').textContent = '观战';
+      $('btnUndo').classList.add('hidden');
+      $('btnResign').classList.add('hidden');
+      $('btnRestart').classList.add('hidden');
+    } else {
+      $('sideTag').textContent = sideName(side) + (side === RED ? '（先手）' : '（后手）');
+      $('btnUndo').classList.remove('hidden');
+      $('btnResign').classList.remove('hidden');
+      $('btnRestart').classList.remove('hidden');
+    }
     const ct = $('connTag');
-    ct.textContent = relay ? '中继连接' : '直连连接';
+    ct.textContent = App.watch ? '观战' : (relay ? '中继连接' : '直连连接');
     ct.className = 'tag on';
     banner(null);
 
-    UI.setOrientation(side);
+    UI.setOrientation(App.watch ? RED : side);
     render();
+    // 房主开局后才开观战信标：观战者进不到还没开打的房间
+    if (App.mode === 'host') Net.beacon(true);
     refreshVoice();
   }
 
@@ -528,10 +570,55 @@
     startJoinCountdown(val);
   }
 
+  function watchRoom() {
+    const val = $('roomInput').value.trim();
+    if (!/^\d{6}$/.test(val)) {
+      lobbyStatus('请输入 6 位数字房间号', true);
+      return;
+    }
+    // 昵称每次进房前现填（不存本机，想换随时换），没昵称不让进、也就发不了
+    const nick = ($('nickInput').value || '').trim().slice(0, 12);
+    if (!nick) {
+      lobbyStatus('观战前请先输入昵称', true);
+      return;
+    }
+    App.mode = 'watch';
+    App.roomId = val;
+    App.watchNick = nick;
+    $('btnCreate').disabled = true;
+    $('btnJoin').disabled = true;
+    $('btnWatch').disabled = true;
+    $('nickInput').disabled = true;
+    Net.watch(val);
+    startWatchCountdown(val);
+  }
+
+  // 观战倒计时（不自动建房：观战只进正在对局的房间）
+  function startWatchCountdown(roomId) {
+    stopWait();
+    waitLeft = 15;
+    lobbyStatus('正在进入观战 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
+    waitTimer = setInterval(function () {
+      if (App.phase !== 'lobby') { stopWait(); return; }
+      if (Net.isConnected()) { stopWait(); lobbyStatus(''); return; }
+      waitLeft--;
+      if (waitLeft <= 0) {
+        stopWait();
+        Net.destroy();
+        backToButtons();
+        lobbyStatus('观战连接超时：请确认房间号，且对局已经开始', true);
+        return;
+      }
+      lobbyStatus('正在进入观战 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
+    }, 1000);
+  }
+
   function backToButtons() {
     stopWait();
     $('btnCreate').disabled = false;
     $('btnJoin').disabled = false;
+    $('btnWatch').disabled = false;
+    $('nickInput').disabled = false;
     $('hostPanel').classList.add('hidden');
   }
 
@@ -674,9 +761,12 @@
     blobToB64(blob, function (b64) {
       if (!b64) { setPttState('idle'); toast('录音读取失败'); return; }
       const id = (Date.now() % 1e9) + '.' + (++vmsgSeq);
-      const entry = { x: 'v', s: 'me', id: id, b: b64, mt: blob.type, d: Math.round(dur), ts: Date.now(), st: 's' };
+      const sd = App.watch ? 'w' : App.mySide;
+      const entry = { x: 'v', s: 'me', sd: sd, id: id, b: b64, mt: blob.type, d: Math.round(dur), ts: Date.now(), st: 's' };
+      if (App.watch && App.watchNick) entry.nm = App.watchNick;
       chatAppend(entry, false);
-      const payload = { t: 'vmsg', id: id, d: entry.d, m: blob.type, b: b64 };
+      const payload = { t: 'vmsg', id: id, d: entry.d, m: blob.type, b: b64, sd: sd };
+      if (entry.nm) payload.nm = entry.nm;
       sendWithAck(id, payload, 0);
     });
   }
@@ -706,11 +796,11 @@
     } catch (e) { return null; }
   }
 
-  /* ---- 聊天记录：全局只留一份存档，永远只有最近 3 条，开新房把旧的顶掉 ---- */
+  /* ---- 聊天记录：全局只留一份存档，永远只有最近 5 条，开新房把旧的顶掉 ---- */
   let chatKey = null;
   let chatRoom = null;
   let chatHist = [];
-  const CHAT_MAX = 3;   // 只留最近 3 条，旧的被新的覆盖（文字语音合计）
+  const CHAT_MAX = 5;   // 只留最近 5 条，旧的被新的覆盖（文字语音合计）
 
   function chatStoreWrite() {
     if (!chatKey || !chatRoom) return;
@@ -794,13 +884,26 @@
     return p(d.getHours()) + ':' + p(d.getMinutes());
   }
 
+  // 消息署名：对局方按「黑方/红方」显示，观战方直接显示昵称（没昵称兜底「观战」）
+  function sdLabel(sd) {
+    if (sd === 'r') return '红方: ';
+    if (sd === 'b') return '黑方: ';
+    if (sd === 'w') return '观战: ';
+    return null;
+  }
+
+  function labelOf(e) {
+    if (e.sd === 'w' && e.nm) return e.nm + ': ';
+    return sdLabel(e.sd) || ((e.s === 'me') ? '我: ' : '对方: ');
+  }
+
   function chatRow(e, fresh) {
     const row = document.createElement('div');
     row.className = (e.x === 'v') ? 'vmsg' : 'msg';
     if (e.id) row.setAttribute('data-id', e.id);
     const from = document.createElement('span');
     from.className = 'from';
-    from.textContent = (e.s === 'me') ? '我: ' : '对方: ';
+    from.textContent = labelOf(e);
     row.appendChild(from);
     if (e.x === 'v') {
       const btn = document.createElement('button');
@@ -896,7 +999,9 @@
     }
     vmsgSeen.push(id);
     if (vmsgSeen.length > 30) vmsgSeen.shift();
-    chatAppend({ x: 'v', s: 'them', id: id, b: msg.b, mt: msg.m, d: msg.d || 0, ts: Date.now(), st: '' }, true);
+    const e = { x: 'v', s: 'them', sd: msg.sd, id: id, b: msg.b, mt: msg.m, d: msg.d || 0, ts: Date.now(), st: '' };
+    if (typeof msg.nm === 'string' && msg.nm) e.nm = msg.nm;
+    chatAppend(e, true);
   }
 
   function renderBgm(on) {
@@ -910,11 +1015,15 @@
   function bind() {
     $('btnCreate').onclick = function () { createRoom(); };
     $('btnJoin').onclick = joinRoom;
+    $('btnWatch').onclick = watchRoom;
     $('roomInput').addEventListener('input', function (e) {
       e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
     });
     $('roomInput').addEventListener('keydown', function (e) {
       if (e.key === 'Enter') joinRoom();
+    });
+    $('nickInput').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') watchRoom();
     });
 
     $('btnCopy').onclick = function () {
@@ -927,7 +1036,7 @@
         {
           label: '确定认输', danger: true, onClick: function () {
             closeModal();
-            Net.send({ t: 'resign' });
+            Net.send({ t: 'resign', sd: App.mySide });
             forceOver(App.mySide === RED ? BLACK : RED, '你方认输');
           }
         },
@@ -954,8 +1063,12 @@
       if (!m) return;
       if (App.phase !== 'playing') { toast('对局开始后才能发送'); return; }
       inp.value = '';
-      Net.send({ t: 'chat', m: m });
-      chatAppend({ x: 't', s: 'me', m: m, ts: Date.now() }, false);
+      const sd = App.watch ? 'w' : App.mySide;
+      const msg = { t: 'chat', m: m, sd: sd };
+      const entry = { x: 't', s: 'me', sd: sd, m: m, ts: Date.now() };
+      if (App.watch && App.watchNick) { msg.nm = App.watchNick; entry.nm = App.watchNick; }
+      Net.send(msg);
+      chatAppend(entry, false);
     }
     $('btnSend').onclick = sendChat;
     $('chatInput').addEventListener('keydown', function (e) {
@@ -1009,7 +1122,8 @@
       chatKey = 'xqchat';
       chatRoom = App.roomId || '';
       chatLoad(chatRoom);
-      startGame(sideForRole(info.role), !!info.relay);
+      App.watch = info.role === 'watch';
+      startGame(App.watch ? RED : sideForRole(info.role), !!info.relay);
       refreshVoice();
       // 请求棋谱：若对方是进行中的棋局（自己刚重新加入），会同步恢复局面
       Net.send({ t: 'sync-req' });
@@ -1046,6 +1160,12 @@
       const ct = $('connTag');
       ct.textContent = '连接已断开';
       ct.className = 'tag off';
+      if (App.watch) {
+        banner('观战连接中断，等待恢复…');
+        render();
+        startResumeRetry();
+        return;
+      }
       banner('对方掉线，棋局暂停，等待重新连线…');
       render();
       startResumeRetry();
@@ -1057,6 +1177,21 @@
       }
     });
 
+    // 观战没找到房间（未开局/不存在）；对局中则按掉线处理继续等
+    Net.on('watch-miss', function () {
+      if (App.phase === 'lobby') {
+        stopWait();
+        Net.destroy();
+        backToButtons();
+        lobbyStatus('该房间未开局或不存在（观战需对局进行中）', true);
+        return;
+      }
+      App.disconnected = true;
+      banner('观战连接中断，等待恢复…');
+      render();
+      startResumeRetry();
+    });
+
     // 对方重新加入（或直连恢复）：清掉断线状态，继续对局
     Net.on('reconnected', function (info) {
       const wasOff = App.disconnected;
@@ -1064,10 +1199,15 @@
       stopResumeRetry();
       banner(null);
       const ct = $('connTag');
-      ct.textContent = (info && info.peer === 'relay') ? '中继连接' : '直连连接';
+      ct.textContent = App.watch ? '观战' : ((info && info.peer === 'relay') ? '中继连接' : '直连连接');
       ct.className = 'tag on';
       if ($('modalTitle').textContent === '对方掉线') closeModal();
       render();
+      if (App.watch) {
+        if (wasOff) toast('观战连接已恢复');
+        Net.send({ t: 'sync-req' });   // 观战断线期间可能错过走棋 → 重新拉棋谱
+        return;
+      }
       toast(wasOff ? '对方已重新连线，对局继续' : '点对点直连已恢复');
       // 主动推棋谱：对方可能刚重新进入页面，其 sync-req 可能早于通道就绪被丢弃
       if (App.history.length) Net.send({ t: 'sync', hist: App.history, swap: App.swapped });
