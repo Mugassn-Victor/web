@@ -27,6 +27,9 @@ const Net = (function () {
   const P2P_WAIT = 10000;   // 信令交换完成后等 P2P 的时间
   const HB_INT = 3000;      // 心跳间隔
   const HB_MAX = 12000;     // 超过这个时间没收到任何消息 → 对方已断
+  let inGame = false;       // 房主侧「本房对局进行中」：缺位敲门先问身份，不直接放人
+  let awaitRole = false;    // 客方输号加入后等房主定身份：收到 'hi'/'ask' 前不建 Peer、不应答
+                            // offer，防止抢在「缺位问身份」之前自动进房（PeerJS 连接比 ask 快）
   const WATCH_TIMEOUT = 10000;   // 观战等房主信标的时限
 
   const _trace = [];
@@ -250,6 +253,8 @@ const Net = (function () {
     dead = false;
     settled = false;
     autoRole = 'host';
+    awaitRole = false;
+    inGame = false;   // 新建的是空房：清掉上一局残留，否则敲门者会被误问「缺位身份」
     lastRoom = roomId;
     peerSid = null;
     pendingData = [];
@@ -259,20 +264,27 @@ const Net = (function () {
     p.on('connection', function (c) { setupConn(c, 'host'); });
   }
 
-  // 加房
-  function join(roomId) {
+  // 加房；asPlayer=true 表示对方已明确选择「以对战方加入」
+  function join(roomId, asPlayer) {
     dead = false;
     settled = false;
     autoRole = 'guest';
     lastRoom = roomId;
     peerSid = null;
     pendingData = [];
-    startMqttSig(roomId, 'guest');
+    // 没明确要下棋就先等房主表态（'hi'=正常放行 / 'ask'=缺位先选身份），
+    // 期间不建 Peer、不应答 offer，房主的快速通道抢不进来
+    awaitRole = !asPlayer;
+    startMqttSig(roomId, 'guest', asPlayer ? 'p' : undefined);
+    if (!awaitRole) startGuestPeer();
+  }
+
+  function startGuestPeer() {
     if (typeof Peer === 'undefined') return;
     const p = newPeer();
     p.on('open', function () {
       if (settled && !(conn && conn._relay)) { try { p.destroy(); } catch (e) {} return; }
-      const c = p.connect(roomId, { reliable: true });
+      const c = p.connect(lastRoom, { reliable: true });
       setupConn(c, 'guest');
     });
   }
@@ -282,6 +294,7 @@ const Net = (function () {
     dead = false;
     settled = false;
     autoRole = 'watch';
+    awaitRole = false;
     lastRoom = roomId;
     peerSid = null;
     pendingData = [];
@@ -326,6 +339,7 @@ const Net = (function () {
   function destroy() {
     dead = true;
     beaconWanted = false;
+    awaitRole = false;
     stopMqttSig();
     clearP2pTimer();
     clearHb();
@@ -390,7 +404,19 @@ const Net = (function () {
     st.mq = null;
   }
 
-  function startMqttSig(room, role) {
+  // 由上层（房主）维护：对局进行中 → 缺位时敲门者要先选身份
+  function setInGame(b) { inGame = !!b; }
+
+  // 房里是否已有存活的对战客方（第三方敲门要被引导去观战）。
+  // 直连看数据通道；中继不能看 conn.open（host 一敲门就 settled，open 只是自家总线
+  // 在线），要看「已收到过对方心跳且没超时判死」——没客方时心跳压根不会出现。
+  function guestPresent() {
+    if (!settled || peerGone) return false;
+    if (conn && conn._relay) return !!(peerSid && (Date.now() - lastHb) < HB_MAX);
+    return !!(conn && conn.open);
+  }
+
+  function startMqttSig(room, role, as) {
     stopMqttSig();
     if (typeof MiniMQTT === 'undefined' || !room) return;
 
@@ -439,7 +465,7 @@ const Net = (function () {
         return;
       }
       if (beaconWanted) armBeacon();   // 房主（含总线重建后）恢复观战信标
-      if (relayWanted && !settled) { relayWanted = false; relayConnect(autoRole || 'guest'); return; }
+      if (relayWanted && !settled && !awaitRole) { relayWanted = false; relayConnect(autoRole || 'guest'); return; }
       if (settled) {
         // 总线重建后房主仍处于中继/掉线兜底状态 → 补发 offer 等对方接回
         if (role === 'host' && st.ensureOffer) st.ensureOffer();
@@ -492,12 +518,20 @@ const Net = (function () {
         };
       } else {
         // 客：先敲门（房主在兜底状态时靠它重新发 offer），应答后周期发布应答码
-        pub({ k: 'j', sid: st.sid });
+        // resume=本标签页上局就是这房的客方（刷新重进）：心跳还没超时时房主可能误判
+        // 满员，带 resume 就不算满员，落到「缺位问身份」而不是被强制转观战；
+        // as='p'：对方已明确选了「以对战方加入」，房主不再弹身份选择
+        let resume = false;
+        try { resume = sessionStorage.getItem('xqseat') === room; } catch (e) {}
+        const knock = function () {
+          pub({ k: 'j', sid: st.sid, resume: resume ? 1 : undefined, as: as || undefined });
+        };
+        knock();
         st.timers.push(setInterval(function () {
           // 中继模式下也继续发：背景打洞靠它触发房主重发 offer / 传应答码
           if (st.done || (settled && !(conn && conn._relay))) return;
           if (st.answer) pub({ k: 'a', sd: st.answer, sid: st.sid });
-          else pub({ k: 'j', sid: st.sid });
+          else knock();
         }, 2500));
       }
     };
@@ -543,19 +577,55 @@ const Net = (function () {
       if (m.k === 'j') {
         // 客方敲门 = 总线已就位：房主立刻先中继连上（不等打洞），并回 'hi' 让客方也连上
         if (role === 'host') {
-          // 房主在线就回 'hi'（含自己处于中继兜底时），让客方不必等周期 offer
-          if (!settled || (conn && conn._relay)) pub({ k: 'hi', sid: st.sid });
+          // 房里已有存活的对战客方 → 回 'full' 让第三方转去观战（老客方带 resume 落到下面）
+          if (guestPresent() && !m.resume) {
+            tr('knock-full');
+            pub({ k: 'full', sid: st.sid });
+            return;
+          }
+          if (inGame && m.as !== 'p') {
+            // 对局进行中但缺人：不猜来者是对战方还是观战方，让对方自选身份
+            tr('knock-ask');
+            pub({ k: 'ask', sid: st.sid });
+          } else if (!settled || (conn && conn._relay)) {
+            // 房主在线就回 'hi'（含自己处于中继兜底时），让客方不必等周期 offer
+            pub({ k: 'hi', sid: st.sid });
+          }
           if (!settled) relayConnect('host');
           if (st.ensureOffer) { tr('knock'); st.ensureOffer(); }
         }
         return;
       }
+      if (m.k === 'ask') {
+        // 对局缺人、房主要求先选身份：停敲门，交给上层弹「加入对战/观战」
+        if (role === 'guest' && !settled) {
+          tr('room-ask');
+          awaitRole = false;
+          stopMqttSig();
+          emit('room-ask');
+        }
+        return;
+      }
+      if (m.k === 'full') {
+        // 对局已有双方：停止敲门，交给上层转入观战流程
+        if (role === 'guest' && !settled) {
+          tr('room-full');
+          awaitRole = false;
+          stopMqttSig();
+          emit('room-full');
+        }
+        return;
+      }
       if (m.k === 'hi') {
-        // 房主确认在线：客方立即走中继开打，打洞在背景继续
-        if (role === 'guest' && !settled) relayConnect('guest');
+        // 房主确认在线（没缺位/已明确要下棋）：此刻才放行 Peer 与 offer，走中继开打
+        if (role === 'guest' && !settled) {
+          if (awaitRole) { awaitRole = false; startGuestPeer(); }
+          relayConnect('guest');
+        }
         return;
       }
       if (typeof m.sd !== 'string') return;
+      if (awaitRole && role === 'guest') { tr('sd-defer'); return; }   // 等身份期间不碰 offer/answer
       if (role === 'host' && m.k === 'a' && !st.accepted) {
         tr('ans-recv');
         st.accepted = true;
@@ -594,6 +664,16 @@ const Net = (function () {
       if (mqttSig !== st) return;
       if (role === 'watch' && !settled) { stopMqttSig(); emit('watch-miss'); return; }
       if (settled && conn && conn._relay) { clearHb(); peerGone = true; emit('closed'); return; }
+      if (!st.done && role === 'host') {
+        // 房主掉总线（大厅被踢/对局中直连期断开）：不自愈就永远收不到敲门，
+        // 缺位问身份、满员转观战全都无从谈起 → 延迟重建信令
+        tr('mq-restart-host settled=' + settled);
+        stopMqttSig();
+        setTimeout(function () {
+          if (!dead && !mqttSig && autoRole === 'host' && lastRoom) startMqttSig(lastRoom, 'host');
+        }, 2000);
+        return;
+      }
       if (!st.done && !settled) stopMqttSig();
     };
     mq.connect();
@@ -727,6 +807,7 @@ const Net = (function () {
     isConnected: isConnected,
     signalingPending: signalingPending,
     resume: resume,
+    setInGame: setInGame,
     _trace: _trace
   };
 })();

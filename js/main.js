@@ -186,6 +186,7 @@
 
   function gameOver(stt) {
     App.phase = 'over';
+    Net.setInGame(false);
     const loser = currentTurn();
     const winner = stt.winner;
     const pattern = (stt.reason === 'checkmate' || stt.reason === 'stalemate')
@@ -233,6 +234,7 @@
 
   function forceOver(winner, reason) {
     App.phase = 'over';
+    Net.setInGame(false);
     render();
     if (App.watch) {
       modal('对局结束', reason + '\n' + sideName(winner) + '获胜',
@@ -283,6 +285,7 @@
     App.pendingRestart = false;
     App.pendingUndo = false;
     App.phase = 'playing';
+    Net.setInGame(true);
     // 再来一局：双方红黑互换
     App.swapped = !App.swapped;
     flipSide();
@@ -295,7 +298,7 @@
   /* ================= 消息 ================= */
 
   // 观战方只处理这些：悔棋/重开请求类弹窗不打扰观众（走棋与同步照常收）
-  const WATCH_OK = ['move', 'sync', 'chat', 'vmsg', 'vak', 'undo-ok', 'restart-ok', 'resign'];
+  const WATCH_OK = ['move', 'sync', 'chat', 'vmsg', 'vak', 'undo-ok', 'restart-ok', 'resign', 'watch-in'];
 
   function onMessage(msg) {
     if (!msg || typeof msg !== 'object') return;
@@ -336,7 +339,7 @@
         const stt = Rules.status(App.state, currentTurn());
         closeModal();
         if (stt.over) { gameOver(stt); }
-        else { App.phase = 'playing'; render(); }
+        else { App.phase = 'playing'; Net.setInGame(true); render(); }
         toast('局面已同步');
         break;
       }
@@ -423,6 +426,12 @@
         }
         break;
       }
+      case 'watch-in': {
+        // 有观战者进入 → 对局双方聊天区出一条系统提示
+        const wn = (typeof msg.nm === 'string' && msg.nm) ? String(msg.nm).slice(0, 12) : '';
+        chatAppend({ x: 's', m: '观战者' + (wn ? '「' + wn + '」' : '') + '进入房间', ts: Date.now() }, false);
+        break;
+      }
       case 'vmsg': {
         if (typeof msg.b === 'string' && msg.b) {
           Net.send({ t: 'vak', id: msg.id });   // 先确认（尽力而为，对方超时会重发）
@@ -478,6 +487,7 @@
     App.mySide = App.watch ? null : side;
     App.history = [];
     App.phase = 'playing';
+    Net.setInGame(true);
     App.sel = null;
     App.targets = [];
     App.pendingUndo = false;
@@ -544,6 +554,10 @@
     stopWait();   // 兜底建房时停掉加入倒计时，别让它覆盖建房提示
     App.mode = 'host';
     App.recovering = !!recovering;
+    fullHint = null;
+    askRoom = null;
+    $('nickRow').classList.add('hidden');
+    $('roleRow').classList.add('hidden');
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
     App.roomId = code || randCode();
@@ -555,40 +569,73 @@
     Net.create(App.roomId);
   }
 
-  function joinRoom() {
+  let fullHint = null;   // 上次「房间已有对战双方」的房号：填了昵称点加入即转观战
+  let askRoom = null;    // 上次「对局进行中但缺人」的房号：回来的人要自选身份
+
+  function joinRoom(forcePlayer) {
     const val = $('roomInput').value.trim();
     if (!/^\d{6}$/.test(val)) {
       lobbyStatus('请输入 6 位数字房间号', true);
       return;
     }
+    // 满员房间：没昵称先提示，有昵称直接转观战（不再有单独的观战按钮）
+    const nick = ($('nickInput').value || '').trim().slice(0, 12);
+    if (fullHint === val) {
+      if (!nick) { promptNick(); return; }
+      startWatch(val, nick);
+      return;
+    }
+    // 缺位身份选择态：点「加入对战」或直接点「加入房间」都算明确要下棋（as='p'）
+    const asP = forcePlayer === true || askRoom === val;
+    askRoom = null;
     // 不在浏览器里存房间号：双方线下沟通房间号，直接输号加入
     App.mode = 'guest';
     App.roomId = val;
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
-    Net.join(val);
+    $('nickRow').classList.add('hidden');
+    $('roleRow').classList.add('hidden');
+    Net.join(val, asP);
     startJoinCountdown(val);
   }
 
-  function watchRoom() {
+  // 满员房间已确认：给出昵称提示，让对方填昵称后再点加入
+  function promptNick() {
+    stopWait();
+    $('btnCreate').disabled = false;
+    $('btnJoin').disabled = false;
+    $('roleRow').classList.add('hidden');
+    $('nickRow').classList.remove('hidden');
+    lobbyStatus('该房间已有对战双方，输入昵称后点「加入房间」即可观战');
+    $('nickInput').focus();
+  }
+
+  // 缺位身份选择里点了「观战」：昵称是门槛
+  function watchChoice() {
     const val = $('roomInput').value.trim();
     if (!/^\d{6}$/.test(val)) {
       lobbyStatus('请输入 6 位数字房间号', true);
       return;
     }
-    // 昵称每次进房前现填（不存本机，想换随时换），没昵称不让进、也就发不了
     const nick = ($('nickInput').value || '').trim().slice(0, 12);
     if (!nick) {
-      lobbyStatus('观战前请先输入昵称', true);
+      lobbyStatus('观战需先输入昵称', true);
+      $('nickInput').focus();
       return;
     }
+    startWatch(val, nick);
+  }
+
+  function startWatch(val, nick) {
     App.mode = 'watch';
     App.roomId = val;
     App.watchNick = nick;
+    fullHint = null;
+    askRoom = null;
     $('btnCreate').disabled = true;
     $('btnJoin').disabled = true;
-    $('btnWatch').disabled = true;
-    $('nickInput').disabled = true;
+    $('nickRow').classList.add('hidden');
+    $('roleRow').classList.add('hidden');
     Net.watch(val);
     startWatchCountdown(val);
   }
@@ -617,8 +664,9 @@
     stopWait();
     $('btnCreate').disabled = false;
     $('btnJoin').disabled = false;
-    $('btnWatch').disabled = false;
     $('nickInput').disabled = false;
+    $('nickRow').classList.add('hidden');
+    $('roleRow').classList.add('hidden');
     $('hostPanel').classList.add('hidden');
   }
 
@@ -899,8 +947,20 @@
 
   function chatRow(e, fresh) {
     const row = document.createElement('div');
-    row.className = (e.x === 'v') ? 'vmsg' : 'msg';
+    row.className = (e.x === 'v') ? 'vmsg' : (e.x === 's' ? 'msg sys' : 'msg');
     if (e.id) row.setAttribute('data-id', e.id);
+    if (e.x === 's') {
+      // 系统行（如「观战者进入」）：无署名，只一句提示
+      const sp = document.createElement('span');
+      sp.className = 'sys';
+      sp.textContent = e.m || '';
+      row.appendChild(sp);
+      const ts0 = document.createElement('span');
+      ts0.className = 'ts';
+      ts0.textContent = chatTime(e.ts);
+      row.appendChild(ts0);
+      return row;
+    }
     const from = document.createElement('span');
     from.className = 'from';
     from.textContent = labelOf(e);
@@ -1014,16 +1074,28 @@
 
   function bind() {
     $('btnCreate').onclick = function () { createRoom(); };
-    $('btnJoin').onclick = joinRoom;
-    $('btnWatch').onclick = watchRoom;
+    $('btnJoin').onclick = function () { joinRoom(); };
+    $('btnAsPlayer').onclick = function () { joinRoom(true); };
+    $('btnAsWatch').onclick = function () { watchChoice(); };
     $('roomInput').addEventListener('input', function (e) {
       e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
+      const v = e.target.value;
+      if (fullHint !== v) fullHint = null;   // 换房号：作废上次满员/缺位提示
+      if (askRoom !== v) askRoom = null;
+      if (!fullHint && !askRoom) {
+        $('nickRow').classList.add('hidden');
+        $('roleRow').classList.add('hidden');
+      } else if (fullHint) {
+        $('roleRow').classList.add('hidden');
+      }
     });
     $('roomInput').addEventListener('keydown', function (e) {
       if (e.key === 'Enter') joinRoom();
     });
     $('nickInput').addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') watchRoom();
+      if (e.key !== 'Enter') return;
+      if (askRoom === $('roomInput').value.trim()) watchChoice();
+      else joinRoom();
     });
 
     $('btnCopy').onclick = function () {
@@ -1123,10 +1195,16 @@
       chatRoom = App.roomId || '';
       chatLoad(chatRoom);
       App.watch = info.role === 'watch';
+      // 本标签页上局是这房的客方 → 记下（刷新重进带 resume，满员也放行不被误转观战）
+      if (info.role === 'guest') {
+        try { sessionStorage.setItem('xqseat', App.roomId || ''); } catch (e) {}
+      }
       startGame(App.watch ? RED : sideForRole(info.role), !!info.relay);
       refreshVoice();
       // 请求棋谱：若对方是进行中的棋局（自己刚重新加入），会同步恢复局面
       Net.send({ t: 'sync-req' });
+      // 有观战者进房：对局双方聊天区各出一条系统提示
+      if (App.watch) Net.send({ t: 'watch-in', nm: App.watchNick || '' });
       // 公共 broker 是 QoS0，sync-req 偶发丢失会让棋谱永远空着 → 恢复前重试
       let tries = 0;
       const iv = setInterval(function () {
@@ -1190,6 +1268,32 @@
       banner('观战连接中断，等待恢复…');
       render();
       startResumeRetry();
+    });
+
+    // 加入的房间已有对战双方 → 自动转观战：有昵称直接进，没昵称弹昵称提示
+    Net.on('room-full', function () {
+      if (App.phase !== 'lobby' || App.mode !== 'guest') return;
+      stopWait();
+      Net.destroy();
+      fullHint = App.roomId;
+      askRoom = null;
+      const nick = ($('nickInput').value || '').trim().slice(0, 12);
+      if (nick) { startWatch(App.roomId, nick); return; }
+      promptNick();
+    });
+
+    // 对局进行中但缺人 → 房主要求先自选身份：[加入对战] / [观战(填昵称)]
+    Net.on('room-ask', function () {
+      if (App.phase !== 'lobby' || App.mode !== 'guest') return;
+      stopWait();
+      Net.destroy();
+      fullHint = null;
+      askRoom = App.roomId;
+      $('btnCreate').disabled = false;
+      $('btnJoin').disabled = false;
+      $('roleRow').classList.remove('hidden');
+      $('nickRow').classList.remove('hidden');
+      lobbyStatus('该房间正在对局且有一方掉线：点「加入对战」继续，或填昵称后点「观战」');
     });
 
     // 对方重新加入（或直连恢复）：清掉断线状态，继续对局

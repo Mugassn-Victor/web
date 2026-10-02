@@ -465,6 +465,8 @@ body {
 }
 .msg .from { color: var(--muted); flex-shrink: 0; }
 .msg .txt { color: var(--accent); }
+.msg.sys { justify-content: center; }
+.msg.sys .sys { color: var(--muted); font-size: 12px; }
 .ts { margin-left: auto; color: #6b5c48; font-size: 11px; flex-shrink: 0; }
 
 .vmsg {
