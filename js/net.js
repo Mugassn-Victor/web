@@ -248,16 +248,21 @@ const Net = (function () {
     return peer;
   }
 
-  // 建房：id 为自定义房间号
-  function create(roomId) {
+  // 开启一次新连接的公共前置：复位会话状态（create / join / watch 共用）
+  function begin(role, roomId) {
     dead = false;
     settled = false;
-    autoRole = 'host';
+    autoRole = role;
     awaitRole = false;
-    inGame = false;   // 新建的是空房：清掉上一局残留，否则敲门者会被误问「缺位身份」
     lastRoom = roomId;
     peerSid = null;
     pendingData = [];
+  }
+
+  // 建房：id 为自定义房间号
+  function create(roomId) {
+    begin('host', roomId);
+    inGame = false;   // 新建的是空房：清掉上一局残留，否则敲门者会被误问「缺位身份」
     startMqttSig(roomId, 'host');
     if (typeof Peer === 'undefined') return;
     const p = newPeer(roomId);
@@ -266,12 +271,7 @@ const Net = (function () {
 
   // 加房；asPlayer=true 表示对方已明确选择「以对战方加入」
   function join(roomId, asPlayer) {
-    dead = false;
-    settled = false;
-    autoRole = 'guest';
-    lastRoom = roomId;
-    peerSid = null;
-    pendingData = [];
+    begin('guest', roomId);
     // 没明确要下棋就先等房主表态（'hi'=正常放行 / 'ask'=缺位先选身份），
     // 期间不建 Peer、不应答 offer，房主的快速通道抢不进来
     awaitRole = !asPlayer;
@@ -291,13 +291,7 @@ const Net = (function () {
 
   // 观战：只挂总线收听 + 发言，不建 Peer、不打洞；见房主信标后入房
   function watch(roomId) {
-    dead = false;
-    settled = false;
-    autoRole = 'watch';
-    awaitRole = false;
-    lastRoom = roomId;
-    peerSid = null;
-    pendingData = [];
+    begin('watch', roomId);
     startMqttSig(roomId, 'watch');
   }
 

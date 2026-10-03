@@ -291,8 +291,11 @@ const UI = (function () {
   /* ---------- 渲染 ---------- */
   function posStyle(el, r, c) {
     const p = T(r, c);
-    el.style.left = (p[0] / 10 * 100) + '%';
-    el.style.top = (p[1] / 11 * 100) + '%';
+    const l = (p[0] / 10 * 100) + '%';
+    const t = (p[1] / 11 * 100) + '%';
+    // 位置未变则跳过写样式，避免每次渲染都触发样式重算
+    if (el.style.left !== l) el.style.left = l;
+    if (el.style.top !== t) el.style.top = t;
   }
 
   function render(state, opts) {
@@ -362,25 +365,22 @@ const UI = (function () {
     setTimeout(function () { b.remove(); }, 450);
   }
 
-  // 将军特效：棋盘中央书法大字 + 红光闪烁
-  function fxCheck() {
+  // 大字特效（将军/绝杀/困毙）：棋盘中央书法字 + 红光闪烁
+  function fx(text, cls, ms) {
     const d = document.createElement('div');
-    d.className = 'check-fx';
-    d.innerHTML = '<span>将 军</span>';
-    board.appendChild(d);
-    board.classList.add('flash');
-    setTimeout(function () { d.remove(); board.classList.remove('flash'); }, 1000);
-  }
-
-  // 绝杀特效：金色大字（3字以上棋型缩小字号防换行）
-  function fxFinish(text) {
-    const d = document.createElement('div');
-    const chars = text.replace(/\s/g, '').length;
-    d.className = 'check-fx finish' + (chars > 2 ? ' long' : '');
+    d.className = 'check-fx' + (cls ? ' ' + cls : '');
     d.innerHTML = '<span>' + text + '</span>';
     board.appendChild(d);
     board.classList.add('flash');
-    setTimeout(function () { d.remove(); board.classList.remove('flash'); }, 1600);
+    setTimeout(function () { d.remove(); board.classList.remove('flash'); }, ms);
+  }
+
+  function fxCheck() { fx('将 军', '', 1000); }
+
+  // 绝杀特效：金色大字（3字以上棋型缩小字号防换行）
+  function fxFinish(text) {
+    const chars = text.replace(/\s/g, '').length;
+    fx(text, 'finish' + (chars > 2 ? ' long' : ''), 1600);
   }
 
   function mark(cls, r, c) {

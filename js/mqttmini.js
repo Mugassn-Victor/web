@@ -3,6 +3,10 @@
    支持多端点轮询：连接失败自动尝试下一个。 */
 'use strict';
 
+// 编解码器单例：避免每次收发都新建对象
+const _TD = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+const _TE = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+
 function MiniMQTT(opts) {
   this.urls = opts.urls || [];
   this.onopen = opts.onopen || function () {};
@@ -117,14 +121,14 @@ MiniMQTT.prototype._feed = function (bytes) {
 };
 
 MiniMQTT.prototype._utf8 = function (u8) {
-  if (typeof TextDecoder !== 'undefined') return new TextDecoder().decode(u8);
+  if (_TD) return _TD.decode(u8);
   let s = '';
   for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
   return s;
 };
 
 MiniMQTT.prototype._bytes = function (s) {
-  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s);
+  if (_TE) return _TE.encode(s);
   const out = [];
   for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 0xff);
   return new Uint8Array(out);

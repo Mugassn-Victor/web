@@ -184,6 +184,26 @@
 
   /* ================= 对局结束 ================= */
 
+  // 终局特效：绝杀/困毙有专属大字特效，返回结果弹窗的延迟毫秒（0 = 立即）
+  function finishFx(reason, pattern) {
+    if (reason === 'checkmate') { UI.fxFinish((pattern || '绝杀').replace(/、/g, ' ').split('').join(' ')); return 800; }
+    if (reason === 'stalemate') { UI.fxFinish('困 毙'); return 800; }
+    return 0;
+  }
+
+  // 结果弹窗：观战只报结果；对局方带「再来一局 / 返回大厅」（胜负音效由调用方播）
+  function showResult(winner, reason) {
+    const text = reason + '\n' + sideName(winner) + '获胜';
+    if (App.watch) {
+      modal('对局结束', text, [{ label: '返回大厅', onClick: leaveToLobby }]);
+      return;
+    }
+    modal(winner === App.mySide ? '胜利' : '失败', text, [
+      { label: '再来一局', primary: true, onClick: function () { closeModal(); requestRestart(); } },
+      { label: '返回大厅', onClick: leaveToLobby }
+    ]);
+  }
+
   function gameOver(stt) {
     App.phase = 'over';
     Net.setInGame(false);
@@ -201,53 +221,18 @@
     };
     const reason = reasonMap[stt.reason] || '对局结束';
     render();
-    if (App.watch) {
-      // 观战：没有胜负感，只报结果
-      const show = function () {
-        modal('对局结束', reason + '\n' + sideName(winner) + '获胜',
-          [{ label: '返回大厅', onClick: leaveToLobby }]);
-      };
-      if (stt.reason === 'checkmate') { UI.fxFinish((pattern || '绝杀').replace(/、/g, ' ').split('').join(' ')); setTimeout(show, 800); }
-      else if (stt.reason === 'stalemate') { UI.fxFinish('困 毙'); setTimeout(show, 800); }
-      else show();
-      return;
-    }
-    if (winner === App.mySide) UI.sound.win(); else UI.sound.lose();
-    const showModal = function () {
-      modal(winner === App.mySide ? '胜利' : '失败',
-        reason + '\n' + sideName(winner) + '获胜',
-        [
-          { label: '再来一局', primary: true, onClick: function () { closeModal(); requestRestart(); } },
-          { label: '返回大厅', onClick: leaveToLobby }
-        ]);
-    };
-    if (stt.reason === 'checkmate') {
-      UI.fxFinish(pattern.replace(/、/g, ' ').split('').join(' '));
-      setTimeout(showModal, 800);
-    } else if (stt.reason === 'stalemate') {
-      UI.fxFinish('困 毙');
-      setTimeout(showModal, 800);
-    } else {
-      showModal();
-    }
+    if (!App.watch) { if (winner === App.mySide) UI.sound.win(); else UI.sound.lose(); }
+    const delay = finishFx(stt.reason, pattern);
+    if (delay > 0) setTimeout(function () { showResult(winner, reason); }, delay);
+    else showResult(winner, reason);
   }
 
   function forceOver(winner, reason) {
     App.phase = 'over';
     Net.setInGame(false);
     render();
-    if (App.watch) {
-      modal('对局结束', reason + '\n' + sideName(winner) + '获胜',
-        [{ label: '返回大厅', onClick: leaveToLobby }]);
-      return;
-    }
-    if (winner === App.mySide) UI.sound.win(); else UI.sound.lose();
-    modal(winner === App.mySide ? '胜利' : '失败',
-      reason + '\n' + sideName(winner) + '获胜',
-      [
-        { label: '再来一局', primary: true, onClick: function () { closeModal(); requestRestart(); } },
-        { label: '返回大厅', onClick: leaveToLobby }
-      ]);
+    if (!App.watch) { if (winner === App.mySide) UI.sound.win(); else UI.sound.lose(); }
+    showResult(winner, reason);
   }
 
   /* ================= 悔棋 / 重开 ================= */
@@ -530,24 +515,40 @@
     if (waitTimer) { clearInterval(waitTimer); waitTimer = null; }
   }
 
-  function startJoinCountdown(roomId) {
+  // 大厅倒计时外壳：每秒刷新 fmt(剩余)；onTick 返回 true 表示本轮已处理（如已连上则停）；
+  // 归零时调 onExpire（无人应答自动建房 / 观战超时）
+  function startCountdown(total, fmt, onTick, onExpire) {
     stopWait();
-    waitLeft = JOIN_TIMEOUT;
-    lobbyStatus('正在连接房间 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
+    waitLeft = total;
+    lobbyStatus(fmt(waitLeft));
     waitTimer = setInterval(function () {
       if (App.phase !== 'lobby') { stopWait(); return; }
+      if (onTick && onTick()) return;
       waitLeft--;
-      if (waitLeft <= 0) {
-        stopWait();
+      if (waitLeft <= 0) { stopWait(); onExpire(); return; }
+      lobbyStatus(fmt(waitLeft));
+    }, 1000);
+  }
+
+  function startJoinCountdown(roomId) {
+    startCountdown(JOIN_TIMEOUT,
+      function (left) { return '正在连接房间 ' + roomId + '…（剩余 ' + left + ' 秒）'; },
+      null,
+      function () {
         if (Net.isConnected()) return;
         // 一直没人应答：可能是房主重新输号恢复 → 用这个号自己建房继续
         Net.destroy();
         createRoom(roomId, true);
         lobbyStatus('无人应答，已用此号为你建房，等待对手加入…');
-        return;
-      }
-      lobbyStatus('正在连接房间 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
-    }, 1000);
+      });
+  }
+
+  // 连接进行中：锁住大厅按钮、收起昵称/身份选择行（backToButtons 反向恢复）
+  function lockLobby() {
+    $('btnCreate').disabled = true;
+    $('btnJoin').disabled = true;
+    $('nickRow').classList.add('hidden');
+    $('roleRow').classList.add('hidden');
   }
 
   function createRoom(code, recovering) {
@@ -556,10 +557,7 @@
     App.recovering = !!recovering;
     fullHint = null;
     askRoom = null;
-    $('nickRow').classList.add('hidden');
-    $('roleRow').classList.add('hidden');
-    $('btnCreate').disabled = true;
-    $('btnJoin').disabled = true;
+    lockLobby();
     App.roomId = code || randCode();
     App.hostRetries = 0;
     // 房间号本地生成，不依赖信令服务器回传，立即显示
@@ -591,10 +589,7 @@
     // 不在浏览器里存房间号：双方线下沟通房间号，直接输号加入
     App.mode = 'guest';
     App.roomId = val;
-    $('btnCreate').disabled = true;
-    $('btnJoin').disabled = true;
-    $('nickRow').classList.add('hidden');
-    $('roleRow').classList.add('hidden');
+    lockLobby();
     Net.join(val, asP);
     startJoinCountdown(val);
   }
@@ -632,32 +627,26 @@
     App.watchNick = nick;
     fullHint = null;
     askRoom = null;
-    $('btnCreate').disabled = true;
-    $('btnJoin').disabled = true;
-    $('nickRow').classList.add('hidden');
-    $('roleRow').classList.add('hidden');
+    lockLobby();
     Net.watch(val);
     startWatchCountdown(val);
   }
 
   // 观战倒计时（不自动建房：观战只进正在对局的房间）
   function startWatchCountdown(roomId) {
-    stopWait();
-    waitLeft = 15;
-    lobbyStatus('正在进入观战 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
-    waitTimer = setInterval(function () {
-      if (App.phase !== 'lobby') { stopWait(); return; }
-      if (Net.isConnected()) { stopWait(); lobbyStatus(''); return; }
-      waitLeft--;
-      if (waitLeft <= 0) {
+    startCountdown(15,
+      function (left) { return '正在进入观战 ' + roomId + '…（剩余 ' + left + ' 秒）'; },
+      function () {
+        if (!Net.isConnected()) return false;
         stopWait();
+        lobbyStatus('');
+        return true;
+      },
+      function () {
         Net.destroy();
         backToButtons();
         lobbyStatus('观战连接超时：请确认房间号，且对局已经开始', true);
-        return;
-      }
-      lobbyStatus('正在进入观战 ' + roomId + '…（剩余 ' + waitLeft + ' 秒）');
-    }, 1000);
+      });
   }
 
   function backToButtons() {
@@ -1082,12 +1071,9 @@
       const v = e.target.value;
       if (fullHint !== v) fullHint = null;   // 换房号：作废上次满员/缺位提示
       if (askRoom !== v) askRoom = null;
-      if (!fullHint && !askRoom) {
-        $('nickRow').classList.add('hidden');
-        $('roleRow').classList.add('hidden');
-      } else if (fullHint) {
-        $('roleRow').classList.add('hidden');
-      }
+      // 昵称行：满员转观战、缺位选身份都要填；身份行只在缺位选择时显示
+      $('nickRow').classList.toggle('hidden', !fullHint && !askRoom);
+      $('roleRow').classList.toggle('hidden', !askRoom);
     });
     $('roomInput').addEventListener('keydown', function (e) {
       if (e.key === 'Enter') joinRoom();

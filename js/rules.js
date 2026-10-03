@@ -1,4 +1,4 @@
-/* 象棋规则引擎：棋盘状态、走法生成、将军/将死判定、棋谱记法 */
+/* 象棋规则引擎：棋盘状态、走法生成、将军/将死判定、棋型识别 */
 'use strict';
 
 const Rules = (function () {
@@ -10,8 +10,6 @@ const Rules = (function () {
     r: { K: '帅', A: '仕', B: '相', N: '马', R: '车', C: '炮', P: '兵' },
     b: { K: '将', A: '士', B: '象', N: '马', R: '车', C: '炮', P: '卒' }
   };
-
-  const CN = ['〇', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
 
   let template = null;
   function buildTemplate() {
@@ -190,11 +188,15 @@ const Rules = (function () {
     return false;
   }
 
-  function applyMove(state, from, to) {
-    const ns = clone(state);
-    ns[to[0]][to[1]] = ns[from[0]][from[1]];
-    ns[from[0]][from[1]] = null;
-    return ns;
+  // 就地走一步、判完立即复原：候选走子不再克隆整盘（性能关键路径）
+  function legalNow(state, fr, fc, tr, tc, side) {
+    const moving = state[fr][fc], target = state[tr][tc];
+    state[tr][tc] = moving;
+    state[fr][fc] = null;
+    const ok = !inCheck(state, side);
+    state[fr][fc] = moving;
+    state[tr][tc] = target;
+    return ok;
   }
 
   // side 方全部合法走法
@@ -207,20 +209,26 @@ const Rules = (function () {
         const ms = pseudoMoves(state, r, c, p);
         for (let i = 0; i < ms.length; i++) {
           const to = ms[i];
-          const target = state[to[0]][to[1]];
-          if (target && target.type === 'K') continue; // 永不生成吃将走法
-          const ns = applyMove(state, [r, c], to);
-          if (!inCheck(ns, side)) res.push({ from: [r, c], to: to });
+          if (state[to[0]][to[1]] && state[to[0]][to[1]].type === 'K') continue; // 永不生成吃将走法
+          if (legalNow(state, r, c, to[0], to[1], side)) res.push({ from: [r, c], to: to });
         }
       }
     }
     return res;
   }
 
+  // 只算指定棋子的合法落点：不再全盘生成后过滤（点选/收子校验的热路径）
   function legalMovesFrom(state, side, r, c) {
-    const all = legalMoves(state, side);
-    return all.filter(function (m) { return m.from[0] === r && m.from[1] === c; })
-              .map(function (m) { return m.to; });
+    const p = state[r][c];
+    if (!p || p.side !== side) return [];
+    const out = [];
+    const ms = pseudoMoves(state, r, c, p);
+    for (let i = 0; i < ms.length; i++) {
+      const to = ms[i];
+      if (state[to[0]][to[1]] && state[to[0]][to[1]].type === 'K') continue;
+      if (legalNow(state, r, c, to[0], to[1], side)) out.push(to);
+    }
+    return out;
   }
 
   function isLegal(state, side, from, to) {
@@ -232,28 +240,38 @@ const Rules = (function () {
     return false;
   }
 
-  // 局面状态
+  // 局面状态。单槽缓存：同一局面对象重复求值直接命中（渲染/点选是高频调用）。
+  // 本引擎约定局面对象创建后只读——合法判定中的走子是同步复原的临时变更，
+  // 改局面必须换新对象（derive/apply 均如此），缓存以对象身份为键才成立。
+  let mSt = null, mSide = null, mOut = null;
   function status(state, sideToMove) {
+    if (state === mSt && sideToMove === mSide) return mOut;
     const kr = findKing(state, RED);
     const kb = findKing(state, BLACK);
-    if (!kr) return { over: true, winner: BLACK, reason: 'king' };
-    if (!kb) return { over: true, winner: RED, reason: 'king' };
-    const moves = legalMoves(state, sideToMove);
-    if (moves.length === 0) {
-      const check = inCheck(state, sideToMove);
-      return {
-        over: true,
-        winner: sideToMove === RED ? BLACK : RED,
-        reason: check ? 'checkmate' : 'stalemate',
-        check: check
-      };
+    let out;
+    if (!kr) out = { over: true, winner: BLACK, reason: 'king' };
+    else if (!kb) out = { over: true, winner: RED, reason: 'king' };
+    else {
+      const moves = legalMoves(state, sideToMove);
+      if (moves.length === 0) {
+        const check = inCheck(state, sideToMove);
+        out = {
+          over: true,
+          winner: sideToMove === RED ? BLACK : RED,
+          reason: check ? 'checkmate' : 'stalemate',
+          check: check
+        };
+      } else {
+        out = { over: false, check: inCheck(state, sideToMove) };
+      }
     }
-    return { over: false, check: inCheck(state, sideToMove) };
+    mSt = state; mSide = sideToMove; mOut = out;
+    return out;
   }
 
-  // 由走法历史推导局面（保证双方状态一致）
+  // 由走法历史推导局面（保证双方状态一致）；单板就地走子，免去每步克隆
   function derive(history) {
-    let st = initialState();
+    const st = initialState();
     for (let i = 0; i < history.length; i++) {
       const m = history[i];
       if (!m || !Array.isArray(m.from) || !Array.isArray(m.to)) return null;
@@ -264,36 +282,11 @@ const Rules = (function () {
       if (p.side !== (i % 2 === 0 ? RED : BLACK)) return null;
       const t = st[tr][tc];
       if (t && t.side === p.side) return null;
-      st = applyMove(st, m.from, m.to);
+      st[tr][tc] = p;
+      st[fr][fc] = null;
     }
     return st;
   }
-
-  // 中国象棋纵线记法：炮二平五 / 马8进7
-  function moveText(state, from, to) {
-    const p = state[from[0]][from[1]];
-    if (!p) return '?';
-    const isRed = p.side === RED;
-    const file = function (c) { return isRed ? CN[9 - c] : String(c + 1); };
-    const name = NAME[p.side][p.type];
-    const forward = function () { return isRed ? to[0] < from[0] : to[0] > from[0]; };
-
-    if (from[1] === to[1]) {
-      const steps = Math.abs(to[0] - from[0]);
-      return name + file(from[1]) + (forward() ? '进' : '退') + (isRed ? CN[steps] : String(steps));
-    }
-    if (from[0] === to[0]) {
-      return name + file(from[1]) + '平' + file(to[1]);
-    }
-    const verb = forward() ? '进' : '退';
-    if (p.type === 'N' || p.type === 'B' || p.type === 'A') {
-      return name + file(from[1]) + verb + file(to[1]);
-    }
-    const steps = Math.abs(to[0] - from[0]);
-    return name + file(from[1]) + verb + (isRed ? CN[steps] : String(steps));
-  }
-
-  function cellName(r, c) { return (9 - c) + ',' + (9 - r); }
 
   // ===== 绝杀棋型识别（sideToMove = 被将死方） =====
   // 同时符合多个棋型时全部收集（去重），按典型度顺序用「、」连接；一个都不匹配则返回「绝杀」
@@ -493,10 +486,7 @@ const Rules = (function () {
           if (ms[i][0] === tr && ms[i][1] === tc) { can = true; break; }
         }
         if (!can) continue;
-        const ns = clone(state);
-        ns[tr][tc] = ns[r][c];
-        ns[r][c] = null;
-        if (!inCheck(ns, bySide)) return true;
+        if (legalNow(state, r, c, tr, tc, bySide)) return true;
       }
     }
     return false;
@@ -537,7 +527,10 @@ const Rules = (function () {
   }
 
   // 返回 { r: [[r,c]…], b: [[r,c]…] } —— 无根被攻的棋子（供红/绿高亮）
+  // 单槽缓存（同 status）：每手棋只需真算一次，点选/重绘直接命中
+  let hSt = null, hOut = null;
   function hanging(state) {
+    if (state === hSt) return hOut;
     const res = { r: [], b: [] };
     const sides = [RED, BLACK];
     for (let si = 0; si < 2; si++) {
@@ -563,27 +556,17 @@ const Rules = (function () {
         }
       }
     }
+    hSt = state; hOut = res;
     return res;
   }
 
   return {
-    RED: RED,
-    BLACK: BLACK,
     NAME: NAME,
     initialState: initialState,
-    clone: clone,
-    pseudoMoves: pseudoMoves,
-    legalMoves: legalMoves,
     legalMovesFrom: legalMovesFrom,
     isLegal: isLegal,
-    inCheck: inCheck,
-    kingsFacing: kingsFacing,
-    findKing: findKing,
-    applyMove: applyMove,
     status: status,
     derive: derive,
-    moveText: moveText,
-    cellName: cellName,
     matePattern: matePattern,
     hanging: hanging
   };
