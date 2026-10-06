@@ -1,0 +1,493 @@
+'use strict';
+/* 语音通话：大厅（房间号 1v1）+ 通话状态机 + 音频引擎。
+   传输复用 net.js 三层兜底（broker 中继 → WebRTC 打洞 → TURN）：
+   - 直连/TURN：音频帧走 DataChannel（JSON，与棋步同管道）
+   - broker 中继：音频帧走同一 Net.send → 自动经总线转发（P2P 打不通也能聊）
+   音频格式：16kHz 单声道 PCM16，每 100ms 一块，base64 后发出。 */
+(function () {
+  const $ = function (id) { return document.getElementById(id); };
+
+  const RATE = 16000;
+  const BLOCK_MS = 100;
+  const BLOCK_SAMPLES = RATE * BLOCK_MS / 1000;   // 1600
+  const PREBUF = 0.15;                            // 播放端抖动缓冲（秒）
+
+  /* ---------- 状态 ---------- */
+  const S = {
+    mode: '',          // 'host' | 'guest'
+    roomId: '',
+    linked: false,     // 与对方已连上
+    disconnected: false,
+    relay: false,      // 当前是否走 broker 中继
+    peerMuted: false,
+    call: 'idle',      // idle | dialing | ringing | in-call
+    callStart: 0,
+    micOn: true
+  };
+  const stats = { sent: 0, recv: 0, dropped: 0, rebased: 0, peak: 0 };
+  S.stats = stats;
+  window.__vc = S;
+
+  /* ---------- 小工具 ---------- */
+  let toastTO = null;
+  function toast(msg) {
+    const el = $('toast');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+    if (toastTO) clearTimeout(toastTO);
+    toastTO = setTimeout(function () { el.classList.add('hidden'); }, 2600);
+  }
+  function setStatus(msg, err) {
+    const el = $('status');
+    el.textContent = msg || '';
+    el.className = 'status' + (err ? ' err' : '');
+  }
+  function showBanner(msg) { const b = $('banner'); b.textContent = msg; b.classList.remove('hidden'); }
+  function hideBanner() { $('banner').classList.add('hidden'); }
+
+  /* ---------- 音频上下文 ---------- */
+  let ac = null, workletReady = false, playGain = null;
+  async function ensureAudio() {
+    if (!ac) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) throw new Error('浏览器不支持 WebAudio');
+      ac = new AC();
+      try {
+        await ac.audioWorklet.addModule('js/worklet.js');
+        workletReady = true;
+      } catch (e) {
+        throw new Error('音频采集模块加载失败：' + (e && e.message || e));
+      }
+    }
+    if (ac.state === 'suspended') { try { await ac.resume(); } catch (e) {} }
+    if (!playGain) {
+      playGain = ac.createGain();
+      playGain.connect(ac.destination);
+    } else {
+      try { playGain.connect(ac.destination); } catch (e) {}
+    }
+    return ac;
+  }
+  // 浏览器自动播放策略：第一次用户手势时解锁音频上下文（铃声才响得出来）
+  function unlockAudio() {
+    ensureAudio().catch(function () {});
+    document.removeEventListener('pointerdown', unlockAudio);
+    document.removeEventListener('keydown', unlockAudio);
+  }
+  document.addEventListener('pointerdown', unlockAudio);
+  document.addEventListener('keydown', unlockAudio);
+
+  /* ---------- 采集 ---------- */
+  let micStream = null, capSrc = null, capNode = null, capMute = null;
+  let seq = 0;
+
+  async function startMic() {
+    if (!ac) throw new Error('音频上下文未就绪');
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    if (!workletReady) throw new Error('采集模块未就绪');
+    capSrc = ac.createMediaStreamSource(micStream);
+    capNode = new AudioWorkletNode(ac, 'cap-proc');
+    capNode.port.onmessage = function (e) { onCap(e.data.pcm, e.data.sr); };
+    capMute = ac.createGain();
+    capMute.gain.value = 0;             // 工作图需要连到 destination 才会跑，输出静音防回授
+    capSrc.connect(capNode);
+    capNode.connect(capMute);
+    capMute.connect(ac.destination);
+    applyMute();
+  }
+  function stopMic() {
+    if (capNode) { try { capNode.port.onmessage = null; capNode.disconnect(); } catch (e) {} capNode = null; }
+    if (capSrc) { try { capSrc.disconnect(); } catch (e) {} capSrc = null; }
+    if (capMute) { try { capMute.disconnect(); } catch (e) {} capMute = null; }
+    if (micStream) { try { micStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} micStream = null; }
+  }
+  function applyMute() {
+    if (micStream) micStream.getAudioTracks().forEach(function (t) { t.enabled = S.micOn; });
+  }
+
+  function onCap(pcm, sr) {
+    if (S.call !== 'in-call' || !S.micOn) return;
+    let p16;
+    try { p16 = resample(pcm, sr, RATE); } catch (e) { return; }
+    const b64 = floatToB64(p16);
+    if (Net.send({ t: 'vc-a', n: seq++, b: b64 })) stats.sent++;
+    else stats.dropped++;
+  }
+
+  /* ---------- 播放 ---------- */
+  let nextT = 0, lastN = -1, playedAny = false;
+
+  function onAudio(msg) {
+    if (S.call === 'idle' || !ac || !playGain) { stats.dropped++; return; }
+    const n = msg.n | 0;
+    if (lastN >= 0 && n <= lastN) { stats.dropped++; return; }   // 乱序/重复
+    let f32;
+    try { f32 = b64ToFloat(msg.b); } catch (e) { stats.dropped++; return; }
+    if (lastN >= 0 && n > lastN + 1) {
+      const gap = Math.min(n - lastN - 1, 30);
+      scheduleBlk(new Float32Array(gap * BLOCK_SAMPLES));        // 丢帧补静音
+    }
+    lastN = n;
+    stats.recv++;
+    let pk = 0;
+    for (let i = 0; i < f32.length; i += 8) { const a = f32[i] < 0 ? -f32[i] : f32[i]; if (a > pk) pk = a; }
+    if (pk > stats.peak) stats.peak = pk;
+    scheduleBlk(f32);
+  }
+
+  function scheduleBlk(f32) {
+    try {
+      const pcm = resample(f32, RATE, ac.sampleRate);
+      const buf = ac.createBuffer(1, Math.max(1, pcm.length), ac.sampleRate);
+      buf.getChannelData(0).set(pcm);
+      const src = ac.createBufferSource();
+      src.buffer = buf;
+      src.connect(playGain);
+      const now = ac.currentTime;
+      if (nextT <= now) {                    // 首帧或断流（缓冲空了）→ 重建时间轴
+        nextT = now + PREBUF;
+        if (playedAny) stats.rebased++;
+        playedAny = true;
+      }
+      src.start(nextT);
+      nextT += buf.duration;
+    } catch (e) { stats.dropped++; }
+  }
+
+  function resetPlayout() { nextT = 0; lastN = -1; playedAny = false; }
+
+  /* ---------- 铃声（WebAudio 振荡器，无音频素材依赖） ---------- */
+  let ringTO = null, ringNodes = [], ringAlive = false;
+  function ringStop() {
+    ringAlive = false;
+    if (ringTO) { clearTimeout(ringTO); ringTO = null; }
+    ringNodes.forEach(function (n) {
+      try { if (n.stop) n.stop(); else n.disconnect(); } catch (e) {}
+    });
+    ringNodes = [];
+  }
+  function ringStart(kind) {
+    ringStop();
+    if (!ac) return;
+    ringAlive = true;
+    const g = ac.createGain(); g.gain.value = 0; g.connect(ac.destination);
+    const freqs = kind === 'dial' ? [450] : [450, 480];
+    const oscs = freqs.map(function (f) {
+      const o = ac.createOscillator(); o.type = 'sine'; o.frequency.value = f; o.connect(g); o.start();
+      return o;
+    });
+    const onMs = kind === 'dial' ? 1000 : 400, offMs = kind === 'dial' ? 4000 : 400;
+    ringNodes = oscs.concat([g]);
+    function cycle(isOn) {
+      if (!ringAlive) return;
+      g.gain.setTargetAtTime(isOn ? 0.10 : 0, ac.currentTime, 0.015);
+      ringTO = setTimeout(function () { cycle(!isOn); }, isOn ? onMs : offMs);
+    }
+    cycle(true);
+  }
+
+  /* ---------- 编解码 ---------- */
+  function resample(f32, from, to) {
+    if (from === to) return f32;
+    const ratio = from / to;
+    const outN = Math.max(1, Math.floor(f32.length / ratio));
+    const out = new Float32Array(outN);
+    for (let i = 0; i < outN; i++) {
+      const pos = i * ratio, i0 = Math.floor(pos);
+      const i1 = i0 + 1 < f32.length ? i0 + 1 : i0;
+      const fr = pos - i0;
+      out[i] = f32[i0] * (1 - fr) + f32[i1] * fr;
+    }
+    return out;
+  }
+  function floatToB64(f32) {
+    const u8 = new Uint8Array(f32.length * 2);
+    const dv = new DataView(u8.buffer);
+    for (let i = 0; i < f32.length; i++) {
+      let v = f32[i];
+      v = v < -1 ? -1 : (v > 1 ? 1 : v);
+      dv.setInt16(i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    }
+    let s = '';
+    for (let i = 0; i < u8.length; i += 0x8000) {
+      s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    }
+    return btoa(s);
+  }
+  function b64ToFloat(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    const dv = new DataView(u8.buffer);
+    const out = new Float32Array(u8.length >> 1);
+    for (let i = 0; i < out.length; i++) out[i] = dv.getInt16(i << 1, true) / 0x8000;
+    return out;
+  }
+
+  /* ---------- 通话状态机 ---------- */
+  async function startCall() {
+    ringStop();
+    S.lastErr = null;
+    try {
+      await ensureAudio();
+      await startMic();
+    } catch (e) {
+      const msg = '无法开启麦克风：' + (e && e.message || e);
+      S.lastErr = String(msg);
+      toast(msg);
+      try { Net.send({ t: 'vc-end' }); } catch (e2) {}
+      S.call = 'idle';
+      refresh();
+      return;
+    }
+    seq = 0;
+    stats.sent = 0; stats.recv = 0; stats.dropped = 0; stats.rebased = 0; stats.peak = 0;
+    resetPlayout();
+    S.call = 'in-call';
+    S.callStart = Date.now();
+    startTimer();
+    refresh();
+  }
+
+  function endCall(reason) {
+    stopMic();
+    ringStop();
+    stopTimer();
+    if (playGain) { try { playGain.disconnect(); } catch (e) {} playGain = null; }
+    resetPlayout();
+    S.call = 'idle';
+    S.callStart = 0;
+    S.micOn = true;
+    S.peerMuted = false;
+    if (reason) toast(reason);
+    refresh();
+  }
+
+  let timerIv = null;
+  function startTimer() {
+    stopTimer();
+    $('callTimer').textContent = '00:00';
+    timerIv = setInterval(function () {
+      const s = Math.floor((Date.now() - S.callStart) / 1000);
+      const m = Math.floor(s / 60), ss = s % 60;
+      $('callTimer').textContent = (m < 10 ? '0' : '') + m + ':' + (ss < 10 ? '0' : '') + ss;
+    }, 500);
+  }
+  function stopTimer() { if (timerIv) { clearInterval(timerIv); timerIv = null; } }
+
+  /* ---------- 消息路由 ---------- */
+  function onMessage(d) {
+    if (!d || typeof d !== 'object') return;
+    switch (d.t) {
+      case 'vc-req':
+        if (!S.linked) return;
+        if (S.call !== 'idle') { try { Net.send({ t: 'vc-busy' }); } catch (e) {} return; }
+        S.call = 'ringing';
+        refresh();
+        ensureAudio().then(function () { ringStart('ring'); }).catch(function () {});
+        break;
+      case 'vc-busy':
+        if (S.call === 'dialing') { ringStop(); S.call = 'idle'; toast('对方占线'); refresh(); }
+        break;
+      case 'vc-ans':
+        if (S.call === 'dialing') startCall();
+        break;
+      case 'vc-end':
+        if (S.call === 'dialing') { ringStop(); S.call = 'idle'; toast('对方拒绝了通话'); refresh(); }
+        else if (S.call === 'ringing') { ringStop(); S.call = 'idle'; refresh(); }
+        else if (S.call === 'in-call') endCall('对方挂断了通话');
+        break;
+      case 'vc-mute':
+        S.peerMuted = !!d.on;
+        refresh();
+        break;
+      case 'vc-a':
+        onAudio(d);
+        break;
+    }
+  }
+
+  /* ---------- 大厅 ---------- */
+  function onCreate() {
+    if (S.mode) return;
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    S.mode = 'host';
+    S.roomId = code;
+    $('roomCode').textContent = code;
+    $('hostPanel').classList.remove('hidden');
+    setStatus('正在建立连接…');
+    Net.create(code);
+    refresh();
+  }
+  function onJoin() {
+    if (S.mode) return;
+    const v = ($('roomInput').value || '').trim();
+    if (!/^\d{6}$/.test(v)) { setStatus('请输入 6 位数字房间号', true); return; }
+    S.mode = 'guest';
+    S.roomId = v;
+    setStatus('正在连接房间 ' + v + '…');
+    Net.join(v, true);
+    refresh();
+  }
+  function resetLobby() {
+    try { Net.destroy(); } catch (e) {}
+    S.mode = ''; S.roomId = ''; S.linked = false;
+    $('hostPanel').classList.add('hidden');
+    refresh();
+  }
+
+  /* ---------- 断线重连（与棋类项目同一套路） ---------- */
+  let resumeTimer = null;
+  function startResumeRetry() {
+    if (resumeTimer) return;
+    Net.resume();
+    resumeTimer = setInterval(function () {
+      if (S.disconnected) Net.resume();
+      else stopResumeRetry();
+    }, 5000);
+  }
+  function stopResumeRetry() {
+    if (resumeTimer) { clearInterval(resumeTimer); resumeTimer = null; }
+  }
+
+  /* ---------- UI 刷新 ---------- */
+  function refresh() {
+    const busy = !!S.mode;
+    $('btnCreate').disabled = busy;
+    $('btnJoin').disabled = busy;
+    $('roomInput').disabled = busy;
+
+    $('peerCard').classList.toggle('hidden', !S.linked);
+    $('btnCall').disabled = !S.linked || S.call !== 'idle';
+
+    $('dialing').classList.toggle('hidden', S.call !== 'dialing');
+    $('incoming').classList.toggle('hidden', S.call !== 'ringing');
+    $('callCard').classList.toggle('hidden', S.call !== 'in-call');
+
+    $('peerState').textContent = S.linked ? '对方已连接' : (S.mode ? '连接中…' : '对方未加入');
+    document.querySelector('.avatar').classList.toggle('live', S.linked);
+
+    $('btnMute').textContent = S.micOn ? '静音' : '取消静音';
+    $('callPeer').textContent = S.peerMuted ? '通话中 · 对方已静音' : '通话中';
+    updateNetHint();
+    updateLinkTag();
+  }
+  function updateNetHint() {
+    if (S.disconnected) { $('netHint').textContent = '连接中断，等待恢复…'; return; }
+    let h = S.relay ? '服务器中继（延迟较高）' : 'P2P 直连';
+    if (S.peerMuted) h += ' · 对方已静音';
+    $('netHint').textContent = h;
+  }
+  function updateLinkTag() {
+    const tag = $('linkTag');
+    if (S.disconnected) { tag.textContent = '已断开'; tag.className = 'tag off'; }
+    else if (!S.linked) { tag.textContent = S.mode ? '连接中' : '未连接'; tag.className = 'tag'; }
+    else if (S.relay) { tag.textContent = '中继'; tag.className = 'tag relay'; }
+    else { tag.textContent = '已连接·直连'; tag.className = 'tag on'; }
+  }
+
+  // 500ms 轮询：链路徽章 + 通话统计
+  setInterval(function () {
+    try {
+      const d = Net.debugState();
+      S.relay = !!(d.settled && d.relay);
+    } catch (e) {}
+    updateNetHint();
+    updateLinkTag();
+    if (S.call === 'in-call') {
+      $('callStats').textContent = '发送 ' + stats.sent + ' · 接收 ' + stats.recv +
+        ' · 重建 ' + stats.rebased + ' · 丢弃 ' + stats.dropped;
+    } else {
+      $('callStats').textContent = '';
+    }
+  }, 500);
+
+  /* ---------- Net 事件 ---------- */
+  Net.on('connected', function () {
+    S.linked = true; S.disconnected = false;
+    stopResumeRetry(); hideBanner(); setStatus('');
+    toast('已连接对方');
+    refresh();
+  });
+  Net.on('reconnected', function () {
+    S.linked = true; S.disconnected = false;
+    stopResumeRetry(); hideBanner();
+    refresh();
+  });
+  Net.on('relay', function () { refresh(); });
+  Net.on('closed', function () {
+    S.disconnected = true;
+    if (S.call !== 'idle') endCall('通话中断，等待重连…');
+    showBanner('连接中断，等待恢复…');
+    startResumeRetry();
+    refresh();
+  });
+  Net.on('conn-error', function (e) {
+    setStatus('连接出错：' + (e && (e.message || String(e)) || '未知错误'), true);
+  });
+  Net.on('room-full', function () {
+    setStatus('该房间已有两人，请另建房间', true);
+    resetLobby();
+  });
+  Net.on('error', function () {});
+  Net.on('data', function (d) {
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { return; } }
+    onMessage(d);
+  });
+  window.addEventListener('beforeunload', function () { try { Net.destroy(); } catch (e) {} });
+
+  /* ---------- 按钮 ---------- */
+  $('btnCreate').onclick = onCreate;
+  $('btnJoin').onclick = onJoin;
+  $('roomInput').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') onJoin();
+  });
+  $('btnCopy').onclick = function () {
+    const code = $('roomCode').textContent;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(code).then(function () { toast('已复制'); }, function () {});
+    } else { toast(code); }
+  };
+  $('btnCall').onclick = function () {
+    if (!S.linked || S.call !== 'idle') return;
+    ensureAudio().then(function () {
+      S.call = 'dialing';
+      refresh();
+      try { Net.send({ t: 'vc-req' }); } catch (e) {}
+      ringStart('dial');
+    }).catch(function (e) { toast('无法开启音频：' + (e && e.message || e)); });
+  };
+  $('btnCancelCall').onclick = function () {
+    ringStop();
+    S.call = 'idle';
+    try { Net.send({ t: 'vc-end' }); } catch (e) {}
+    refresh();
+  };
+  $('btnAnswer').onclick = function () {
+    if (S.call !== 'ringing') return;
+    ringStop();
+    try { Net.send({ t: 'vc-ans' }); } catch (e) {}
+    startCall();
+  };
+  $('btnReject').onclick = function () {
+    if (S.call !== 'ringing') return;
+    ringStop();
+    try { Net.send({ t: 'vc-end' }); } catch (e) {}
+    S.call = 'idle';
+    refresh();
+  };
+  $('btnHangup').onclick = function () {
+    try { Net.send({ t: 'vc-end' }); } catch (e) {}
+    endCall('通话已结束');
+  };
+  $('btnMute').onclick = function () {
+    S.micOn = !S.micOn;
+    applyMute();
+    try { Net.send({ t: 'vc-mute', on: !S.micOn }); } catch (e) {}
+    refresh();
+  };
+
+  refresh();
+})();

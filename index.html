@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>语音通话</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="phone">
+  <header>
+    <h1>语音通话</h1>
+    <span id="linkTag" class="tag">未连接</span>
+  </header>
+
+  <!-- 大厅：创建/加入房间 -->
+  <section id="lobbyCard">
+    <button id="btnCreate" class="btn primary">创建房间</button>
+    <div class="divider"><span>或</span></div>
+    <div class="join-row">
+      <input id="roomInput" type="text" maxlength="6" placeholder="输入 6 位房间号" autocomplete="off">
+      <button id="btnJoin" class="btn">加入房间</button>
+    </div>
+
+    <div id="hostPanel" class="hidden">
+      <p class="label">房间号（发给对方）</p>
+      <div class="code-row">
+        <span id="roomCode" class="room-code">------</span>
+        <button id="btnCopy" class="btn small">复制</button>
+      </div>
+      <p class="waiting">等待对方加入…</p>
+    </div>
+
+    <p id="status" class="status"></p>
+  </section>
+
+  <!-- 对方 / 拨打 -->
+  <section id="peerCard" class="hidden">
+    <div class="peer-row">
+      <div class="avatar" aria-hidden="true"><span></span></div>
+      <div class="peer-info">
+        <div id="peerState">对方未加入</div>
+        <div id="netHint" class="hint">连接建立中…</div>
+      </div>
+    </div>
+    <button id="btnCall" class="btn primary big" disabled>拨打</button>
+  </section>
+
+  <!-- 通话中 -->
+  <section id="callCard" class="hidden">
+    <div id="callTimer" class="timer">00:00</div>
+    <div id="callPeer" class="hint">通话中</div>
+    <div class="btn-row">
+      <button id="btnMute" class="btn">静音</button>
+      <button id="btnHangup" class="btn danger">挂断</button>
+    </div>
+    <div id="callStats" class="stats"></div>
+  </section>
+
+  <!-- 来电 -->
+  <div id="incoming" class="overlay hidden">
+    <div class="ov-card">
+      <p class="ov-title">来电…</p>
+      <p class="hint" id="incomingPeer">对方邀请通话</p>
+      <div class="btn-row">
+        <button id="btnAnswer" class="btn primary">接听</button>
+        <button id="btnReject" class="btn danger">拒绝</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 拨号中 -->
+  <div id="dialing" class="overlay hidden">
+    <div class="ov-card">
+      <p class="ov-title">正在呼叫…</p>
+      <p class="hint">等待对方接听</p>
+      <div class="btn-row">
+        <button id="btnCancelCall" class="btn danger">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="banner" class="banner hidden"></div>
+  <div id="toast" class="toast hidden"></div>
+</div>
+
+<script>
+/* 测试钩子：?deadrtc=1 时先注入「P2P 全灭」桩，迫使走 broker 中继 */
+if (/[?&]deadrtc=1/.test(location.search)) {
+  document.write('<script src="js/deadrtc.js"><\/script>');
+}
+</script>
+<script src="js/mqttmini.js"></script>
+<script src="js/net.js"></script>
+<script src="js/voice.js"></script>
+</body>
+</html>
