@@ -229,7 +229,7 @@ const Net = (function () {
       }
       // 背景慢慢打洞：中继模式下房主周期性重发 offer，打通即自动升级直连
       if (autoRole === 'host' && !hostHealthy() && mqttSig && mqttSig.ensureOffer &&
-          Date.now() - lastPunch >= 15000) {
+          Date.now() - lastPunch >= 5000) {
         lastPunch = Date.now();
         tr('bg-punch');
         mqttSig.ensureOffer();
@@ -541,7 +541,7 @@ const Net = (function () {
           st.offer = code;
           publishOffer();
         }).catch(function () { st.ensuring = false; });
-        st.timers.push(setInterval(publishOffer, 2500));
+        st.timers.push(setInterval(publishOffer, 1000));
 
         // 兜底重连：对方刷新页面后重进会先「敲门」，此时房主若在中继/掉线状态
         // （对方早已收不到周期 offer），要重新生成 offer、放开应答闸，让对方接回
@@ -550,13 +550,14 @@ const Net = (function () {
           if (!st.mq || !st.mq._opened) { tr('ensure-skip nobus'); return; }
           if (hostHealthy()) { tr('ensure-skip healthy'); return; }
           if (!settled && (st.offer || st.ensuring)) { tr('ensure-skip inflight'); return; }
-          // 'new' 不拦截：TURN 全挂的环境里旧 offer 的 pc 会永远停在 new，
-          // 拦了就会让客方敲门永远得不到新 offer（中继兜底模式下无法重连）
-          if (mpc && ['checking', 'connected', 'completed'].indexOf(mpc.iceConnectionState) >= 0) {
+          const now = Date.now();
+          // 通道已打开 = 真健康；否则握手 4s 内（new/checking/connected 起步阶段）不打断，
+          // 超 4s 还没通（ICE 卡 checking、或 ICE 连上但 DTLS/通道死活不开）→ 放行重建重试
+          if (mpc && mdc && mdc.readyState === 'open') { tr('ensure-skip dc-open'); return; }
+          if (mpc && now - mpcSince < 4000) {
             tr('ensure-skip mpc=' + mpc.iceConnectionState); return;
           }
-          const now = Date.now();
-          if (st.ensuring || now - st.lastEnsure < 6000) { tr('ensure-skip throttle'); return; }
+          if (st.ensuring || now - st.lastEnsure < 2500) { tr('ensure-skip throttle'); return; }
           tr('ensure-run');
           st.lastEnsure = now;
           st.ensuring = true;
@@ -572,7 +573,7 @@ const Net = (function () {
                   clearInterval(st.offerTimer); st.offerTimer = null; return;
                 }
                 if (st.offer) pub({ k: 'o', sd: st.offer, sid: st.sid });
-              }, 2500);
+              }, 1000);
               st.timers.push(st.offerTimer);
             }
           }).catch(function () { st.ensuring = false; });
@@ -594,7 +595,7 @@ const Net = (function () {
           if (st.done || (settled && !(conn && conn._relay))) return;
           if (st.answer) pub({ k: 'a', sd: st.answer, sid: st.sid });
           else knock();
-        }, 2500));
+        }, 1000));
       }
     };
 
@@ -793,6 +794,7 @@ const Net = (function () {
 
   let mpc = null;   // 手动/备用信令的 RTCPeerConnection
   let mdc = null;   // 对应的 DataChannel
+  let mpcSince = 0; // mpc 建立时间：4s 内算正常握手，超时才允许重建（防卡死）
 
   function enc(o) { return btoa(JSON.stringify(o)); }
   function dec(s) { return JSON.parse(atob(String(s).replace(/\s+/g, ''))); }
@@ -811,7 +813,9 @@ const Net = (function () {
         if (pc.iceGatheringState === 'complete') finish();
       };
       pc.addEventListener('icegatheringstatechange', onState);
-      setTimeout(finish, ms || 8000);   // 收集不完也带着已有候选先走
+      // 收集不完也带着已有候选先走：语音要把 P2P 升级从 ~8s 压到 ~2-3s，
+      // 静网/同机场景 host 候选几十毫秒就齐，STUN/TURN 不通时不再空等
+      setTimeout(finish, ms || 1500);
     });
   }
 
@@ -847,11 +851,12 @@ const Net = (function () {
     dead = false;
     manualClose();
     mpc = new RTCPeerConnection({ iceServers: ICE });
+    mpcSince = Date.now();
     watchIce(mpc);
     mdc = mpc.createDataChannel('xq', { ordered: true });
     return mpc.createOffer()
       .then(function (o) { return mpc.setLocalDescription(o); })
-      .then(function () { return waitGathering(mpc); })
+      .then(function () { return waitGathering(mpc, 1500); })
       .then(function () {
         if (!mpc || !mpc.localDescription) throw new Error('生成连接码失败');
         return enc({ t: mpc.localDescription.type, s: mpc.localDescription.sdp });
@@ -879,6 +884,7 @@ const Net = (function () {
       return Promise.reject(new Error('连接码无效或已过期'));
     }
     mpc = new RTCPeerConnection({ iceServers: ICE });
+    mpcSince = Date.now();
     watchIce(mpc);
     mpc.ondatachannel = function (e) {
       mdc = e.channel;
@@ -887,7 +893,7 @@ const Net = (function () {
     return mpc.setRemoteDescription({ type: d.t, sdp: d.s })
       .then(function () { return mpc.createAnswer(); })
       .then(function (a) { return mpc.setLocalDescription(a); })
-      .then(function () { return waitGathering(mpc); })
+      .then(function () { return waitGathering(mpc, 1000); })
       .then(function () {
         if (!mpc || !mpc.localDescription) throw new Error('生成应答码失败');
         return enc({ t: mpc.localDescription.type, s: mpc.localDescription.sdp });

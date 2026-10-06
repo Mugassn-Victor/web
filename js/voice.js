@@ -3,14 +3,17 @@
    传输复用 net.js 三层兜底（broker 中继 → WebRTC 打洞 → TURN）：
    - 直连/TURN：音频帧走 DataChannel（JSON，与棋步同管道）
    - broker 中继：音频帧走同一 Net.send → 自动经总线转发（P2P 打不通也能聊）
-   音频格式：16kHz 单声道 PCM16，每 100ms 一块，base64 后发出。 */
+   音频格式：16kHz 单声道 PCM16，每 50ms 一块，base64 后发出。 */
 (function () {
   const $ = function (id) { return document.getElementById(id); };
 
   const RATE = 16000;
-  const BLOCK_MS = 100;
-  const BLOCK_SAMPLES = RATE * BLOCK_MS / 1000;   // 1600
-  const PREBUF = 0.15;                            // 播放端抖动缓冲（秒）
+  const BLOCK_MS = 50;
+  const BLOCK_SAMPLES = RATE * BLOCK_MS / 1000;   // 800
+  const PREBUF_INIT = 0.15;   // 初始抖动缓冲（秒）
+  const PREBUF_MIN = 0.06;    // 稳态下限：健康链路稳态只留 60ms
+  const PREBUF_MAX = 0.4;     // 断流补偿封顶：坏链路也最多 +400ms
+  const REBUF_STEP = 0.05;    // 每次断流把缓冲抬高的步长（不再固定 +150ms）
 
   /* ---------- 状态 ---------- */
   const S = {
@@ -26,6 +29,7 @@
   };
   const stats = { sent: 0, recv: 0, dropped: 0, rebased: 0, peak: 0 };
   S.stats = stats;
+  let lastReqT = 0;   // vc-req 去重窗口（发送端重发的同一次呼叫）
   window.__vc = S;
 
   /* ---------- 小工具 ---------- */
@@ -36,6 +40,16 @@
     el.classList.remove('hidden');
     if (toastTO) clearTimeout(toastTO);
     toastTO = setTimeout(function () { el.classList.add('hidden'); }, 2600);
+  }
+  // 控制消息走 QoS0 中继可能被丢（挂断后对方会卡在通话中）：
+  // 立即 + 150ms + 400ms 重发三次，接收端全部幂等（中继丢一两发也不怕）
+  function sendCtl(m) {
+    [0, 150, 400].forEach(function (delay) {
+      setTimeout(function () {
+        if (!S.mode) return;
+        try { Net.send(m); } catch (e) {}
+      }, delay);
+    });
   }
   function setStatus(msg, err) {
     const el = $('status');
@@ -79,7 +93,7 @@
 
   /* ---------- 采集 ---------- */
   let micStream = null, capSrc = null, capNode = null, capMute = null;
-  let seq = 0;
+  let seq = 0, pend = null;   // pend：中继模式下攒着的半块（凑满 100ms 再发）
 
   async function startMic() {
     if (!ac) throw new Error('音频上下文未就绪');
@@ -108,16 +122,34 @@
   }
 
   function onCap(pcm, sr) {
-    if (S.call !== 'in-call' || !S.micOn) return;
+    if (S.call !== 'in-call') return;
+    if (!S.micOn) { pend = null; return; }
     let p16;
     try { p16 = resample(pcm, sr, RATE); } catch (e) { return; }
+    if (S.relay) {
+      // broker 中继（QoS0 公共节点）扛不住 20 帧/秒的速率，实测丢帧率会翻倍：
+      // 攒两块 50ms 合成一块 100ms 发（帧率降到 10/秒，与改版前同速率）
+      if (pend) { sendFrame(concatF32(pend, p16), BLOCK_MS * 2); pend = null; }
+      else pend = p16;
+    } else {
+      if (pend) { sendFrame(pend, BLOCK_MS); pend = null; }   // 中继→直连切换：把攒着的先发掉
+      sendFrame(p16, BLOCK_MS);
+    }
+  }
+  function sendFrame(p16, ms) {
     const b64 = floatToB64(p16);
-    if (Net.send({ t: 'vc-a', n: seq++, b: b64 })) stats.sent++;
+    if (Net.send({ t: 'vc-a', n: seq++, b: b64, d: ms })) stats.sent++;
     else stats.dropped++;
+  }
+  function concatF32(a, b) {
+    const c = new Float32Array(a.length + b.length);
+    c.set(a); c.set(b, a.length);
+    return c;
   }
 
   /* ---------- 播放 ---------- */
   let nextT = 0, lastN = -1, playedAny = false;
+  let prebuf = PREBUF_INIT, lastUnderrunT = 0, lastShrinkT = 0;
 
   function onAudio(msg) {
     if (S.call === 'idle' || !ac || !playGain) { stats.dropped++; return; }
@@ -125,9 +157,10 @@
     if (lastN >= 0 && n <= lastN) { stats.dropped++; return; }   // 乱序/重复
     let f32;
     try { f32 = b64ToFloat(msg.b); } catch (e) { stats.dropped++; return; }
+    const blkSamples = Math.round(RATE * (msg.d === 100 ? 100 : BLOCK_MS) / 1000);
     if (lastN >= 0 && n > lastN + 1) {
       const gap = Math.min(n - lastN - 1, 30);
-      scheduleBlk(new Float32Array(gap * BLOCK_SAMPLES));        // 丢帧补静音
+      scheduleBlk(new Float32Array(gap * blkSamples));        // 丢帧补静音
     }
     lastN = n;
     stats.recv++;
@@ -146,17 +179,34 @@
       src.buffer = buf;
       src.connect(playGain);
       const now = ac.currentTime;
+      const wall = Date.now();
+      // 健康播放 1s 后每秒收缩 15ms：150ms 起步 → 约 6s 后稳到 60ms
+      if (playedAny && wall - lastUnderrunT > 1000 && wall - lastShrinkT > 1000 &&
+          prebuf > PREBUF_MIN) {
+        prebuf = Math.max(PREBUF_MIN, prebuf - 0.015);
+        lastShrinkT = wall;
+      }
       if (nextT <= now) {                    // 首帧或断流（缓冲空了）→ 重建时间轴
-        nextT = now + PREBUF;
-        if (playedAny) stats.rebased++;
+        if (playedAny) {
+          prebuf = Math.min(PREBUF_MAX, prebuf + REBUF_STEP);  // 断流：抬高缓冲防连环卡顿
+          stats.rebased++;
+        } else {
+          prebuf = PREBUF_INIT;              // 新通话从初始缓冲起步
+        }
+        nextT = now + prebuf;
         playedAny = true;
+        lastUnderrunT = wall;
+        lastShrinkT = wall;
       }
       src.start(nextT);
       nextT += buf.duration;
     } catch (e) { stats.dropped++; }
   }
 
-  function resetPlayout() { nextT = 0; lastN = -1; playedAny = false; }
+  function resetPlayout() {
+    nextT = 0; lastN = -1; playedAny = false;
+    prebuf = PREBUF_INIT; lastUnderrunT = 0; lastShrinkT = 0;
+  }
 
   /* ---------- 铃声（WebAudio 振荡器，无音频素材依赖） ---------- */
   let ringTO = null, ringNodes = [], ringAlive = false;
@@ -228,8 +278,17 @@
 
   /* ---------- 通话状态机 ---------- */
   async function startCall() {
+    if (S.call === 'in-call') return;   // vc-ans 重发会在 await 让出的间隙并发进来，先闸死
     ringStop();
     S.lastErr = null;
+    seq = 0;
+    pend = null;
+    stats.sent = 0; stats.recv = 0; stats.dropped = 0; stats.rebased = 0; stats.peak = 0;
+    resetPlayout();
+    S.call = 'in-call';                 // 状态在第一个 await 之前落地：杜绝双开采集
+    S.callStart = Date.now();
+    startTimer();
+    refresh();
     try {
       await ensureAudio();
       await startMic();
@@ -237,18 +296,12 @@
       const msg = '无法开启麦克风：' + (e && e.message || e);
       S.lastErr = String(msg);
       toast(msg);
-      try { Net.send({ t: 'vc-end' }); } catch (e2) {}
+      stopTimer();
+      sendCtl({ t: 'vc-end' });
       S.call = 'idle';
+      S.callStart = 0;
       refresh();
-      return;
     }
-    seq = 0;
-    stats.sent = 0; stats.recv = 0; stats.dropped = 0; stats.rebased = 0; stats.peak = 0;
-    resetPlayout();
-    S.call = 'in-call';
-    S.callStart = Date.now();
-    startTimer();
-    refresh();
   }
 
   function endCall(reason) {
@@ -283,7 +336,10 @@
     switch (d.t) {
       case 'vc-req':
         if (!S.linked) return;
-        if (S.call !== 'idle') { try { Net.send({ t: 'vc-busy' }); } catch (e) {} return; }
+        if (Date.now() - lastReqT < 1000) break;   // 三次重发里的重复呼叫
+        lastReqT = Date.now();
+        if (S.call === 'ringing') break;
+        if (S.call !== 'idle') { sendCtl({ t: 'vc-busy' }); return; }
         S.call = 'ringing';
         refresh();
         ensureAudio().then(function () { ringStart('ring'); }).catch(function () {});
@@ -405,18 +461,20 @@
   }, 500);
 
   /* ---------- Net 事件 ---------- */
-  Net.on('connected', function () {
+  Net.on('connected', function (e) {
+    S.relay = !!(e && e.peer === 'relay');   // 首连即拿到真实传输（省掉等下一次 500ms 轮询）
     S.linked = true; S.disconnected = false;
     stopResumeRetry(); hideBanner(); setStatus('');
     toast('已连接对方');
     refresh();
   });
-  Net.on('reconnected', function () {
+  Net.on('reconnected', function (e) {
+    S.relay = !!(e && e.peer === 'relay');   // 升级/降级都会带 peer 信息
     S.linked = true; S.disconnected = false;
     stopResumeRetry(); hideBanner();
     refresh();
   });
-  Net.on('relay', function () { refresh(); });
+  Net.on('relay', function () { S.relay = true; refresh(); });
   Net.on('closed', function () {
     S.disconnected = true;
     if (S.call !== 'idle') endCall('通话中断，等待重连…');
@@ -455,37 +513,37 @@
     ensureAudio().then(function () {
       S.call = 'dialing';
       refresh();
-      try { Net.send({ t: 'vc-req' }); } catch (e) {}
+      sendCtl({ t: 'vc-req' });
       ringStart('dial');
     }).catch(function (e) { toast('无法开启音频：' + (e && e.message || e)); });
   };
   $('btnCancelCall').onclick = function () {
     ringStop();
     S.call = 'idle';
-    try { Net.send({ t: 'vc-end' }); } catch (e) {}
+    sendCtl({ t: 'vc-end' });
     refresh();
   };
   $('btnAnswer').onclick = function () {
     if (S.call !== 'ringing') return;
     ringStop();
-    try { Net.send({ t: 'vc-ans' }); } catch (e) {}
+    sendCtl({ t: 'vc-ans' });
     startCall();
   };
   $('btnReject').onclick = function () {
     if (S.call !== 'ringing') return;
     ringStop();
-    try { Net.send({ t: 'vc-end' }); } catch (e) {}
+    sendCtl({ t: 'vc-end' });
     S.call = 'idle';
     refresh();
   };
   $('btnHangup').onclick = function () {
-    try { Net.send({ t: 'vc-end' }); } catch (e) {}
+    sendCtl({ t: 'vc-end' });
     endCall('通话已结束');
   };
   $('btnMute').onclick = function () {
     S.micOn = !S.micOn;
     applyMute();
-    try { Net.send({ t: 'vc-mute', on: !S.micOn }); } catch (e) {}
+    sendCtl({ t: 'vc-mute', on: !S.micOn });
     refresh();
   };
 

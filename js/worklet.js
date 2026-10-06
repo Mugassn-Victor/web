@@ -1,12 +1,12 @@
 'use strict';
-/* 采集端 AudioWorklet：把麦克风的实时 PCM 按 ~100ms 聚合成块 post 给主线程。
+/* 采集端 AudioWorklet：把麦克风的实时 PCM 按 ~50ms 聚合成块 post 给主线程。
    只采集不上送扬声器（输出保持静音连接，见 voice.js 的零增益 mute 节点）。 */
 class CapProc extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.acc = new Float32Array(16384);   // ≥ 100ms @96kHz(9600)
+    this.acc = new Float32Array(16384);   // ≥ 50ms @96kHz(4800)
     this.n = 0;
-    this.emit = Math.round(sampleRate * 0.1);
+    this.emit = Math.round(sampleRate * 0.05);
   }
   process(inputs) {
     const input = inputs[0];
