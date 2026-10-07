@@ -453,7 +453,8 @@
     try {
       await ensureAudio();
       await startMic();
-      startFlush();                        // 编码结果按网络节奏发出（直连 50ms / 中继 100ms）
+      ringStop();                       // 双保险：封杀 await 间隙里才落地的晚到铃声
+      startFlush();                     // 编码结果按网络节奏发出（直连 50ms / 中继 100ms）
     } catch (e) {
       const msg = '无法开启麦克风：' + (e && e.message || e);
       S.lastErr = String(msg);
@@ -505,7 +506,12 @@
         if (S.call !== 'idle') { sendCtl({ t: 'vc-busy' }); return; }
         S.call = 'ringing';
         refresh();
-        ensureAudio().then(function () { ringStart('ring'); }).catch(function () {});
+        // 竞态：铃声要等 AudioContext/worklet 就绪才起，慢手机上用户可能已经接听
+        // （btnAnswer 的 ringStop 跑在前面停了个空）——不加状态闸，晚到的铃声会
+        // 整个通话期间一直响，而闭麦只是关麦克风、根本管不到本地振荡器
+        ensureAudio().then(function () {
+          if (S.call === 'ringing') ringStart('ring');
+        }).catch(function () {});
         break;
       case 'vc-busy':
         if (S.call === 'dialing') { ringStop(); S.call = 'idle'; toast('对方占线'); refresh(); }
@@ -696,11 +702,11 @@
   };
   $('btnCall').onclick = function () {
     if (!S.linked || S.call !== 'idle') return;
+    S.call = 'dialing';                // 同步落地：vc-ans 秒回/用户秒取消都不会被状态闸挡住
+    refresh();
+    sendCtl({ t: 'vc-req' });
     ensureAudio().then(function () {
-      S.call = 'dialing';
-      refresh();
-      sendCtl({ t: 'vc-req' });
-      ringStart('dial');
+      if (S.call === 'dialing') ringStart('dial');   // 等待期间可能已接通/取消
     }).catch(function (e) { toast('无法开启音频：' + (e && e.message || e)); });
   };
   $('btnCancelCall').onclick = function () {
