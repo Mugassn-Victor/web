@@ -39,8 +39,10 @@
   const stats = { sent: 0, recv: 0, dropped: 0, rebased: 0, peak: 0, codec: '', e2e: 0, dtxMs: 0 };
   S.stats = stats;
   let lastReqT = 0;   // vc-req 去重窗口（发送端重发的同一次呼叫）
+  let lastReqKey = '';   // 去重按 sid+cid 认：只吸同一呼叫者的三次重发，不吞新成员的拨打
   let dialSeq = 0, callCid = 0;   // 当前呼叫 id：拨号自增赋值、响铃取对端 req 的 cid；
   // vc-ans/busy/end 只受理当前呼叫的（上一通的重发/迟到消息跨不了窗，防串线）
+  let callSid = '';   // 当前来电者 sid（响铃中别人打入 → 回占线）
   let roster = {};     // 房内成员 sid → {nick, st, mute, last}（vc-pres 周期维护）
   let spkEnd = {};     // sid → 最近一次「在说话」的时间戳（收端帧峰值 + 本端 RMS）
   let multiMode = false;   // 房间 ≥3 人（Net.setMulti 已锁中继）
@@ -833,14 +835,22 @@
   function onMessage(d) {
     if (!d || typeof d !== 'object') return;
     switch (d.t) {
-      case 'vc-req':
+      case 'vc-req': {
         if (!S.linked) return;
-        if (Date.now() - lastReqT < 1000) break;   // 三次重发里的重复呼叫
+        const rk = (d.sid || '?') + ':' + (d.cid | 0);
+        if (Date.now() - lastReqT < 1000 && rk === lastReqKey) break;   // 同一呼叫者的三次重发（0/150/400ms）
         lastReqT = Date.now();
-        if (S.call === 'ringing') break;
+        lastReqKey = rk;
+        if (S.call === 'ringing') {
+          // 已有来电在响：当前来电者是重发 → 忽略；别人打入 → 占线回执
+          // （新成员拨打通话中/响铃中/拨打中的人，都该收到「对方占线」）
+          if (d.sid && callSid && d.sid !== callSid) sendCtl({ t: 'vc-busy', cid: d.cid | 0 });
+          return;
+        }
         if (S.call !== 'idle') { sendCtl({ t: 'vc-busy', cid: d.cid | 0 }); return; }
         S.call = 'ringing';
         callCid = d.cid | 0;
+        callSid = d.sid || '';
         refresh();
         // 竞态：铃声要等 AudioContext/worklet 就绪才起，慢手机上用户可能已经接听
         // （btnAnswer 的 ringStop 跑在前面停了个空）——不加状态闸，晚到的铃声会
@@ -851,9 +861,16 @@
           startMic().catch(function () {});
         }).catch(function () {});
         break;
+      }
       case 'vc-busy':
         if (d.cid && d.cid !== callCid) break;   // 上一通的迟到占线回执
-        if (S.call === 'dialing') { ringStop(); stopMic(); S.call = 'idle'; toast('对方占线'); refresh(); }
+        if (S.call === 'dialing') {
+          ringStop(); stopMic(); S.call = 'idle'; toast('对方占线');
+          // 占线撤销：我这一呼可能把房里空闲者拉响了铃，占线就得替我解铃
+          // （bc=1：只解响铃，cid 跨端会撞号，不能误伤通话中/拨号中的人）
+          sendCtl({ t: 'vc-end', cid: callCid, bc: 1 });
+          refresh();
+        }
         break;
       case 'vc-ans':
         try { Net._trace.push((Date.now() % 100000000) + ' vc-ans-recv'); } catch (e) {}
@@ -862,6 +879,7 @@
         break;
       case 'vc-end':
         if (d.cid && d.cid !== callCid) break;   // 陈旧挂断（上一通的重发）：不受理
+        if (d.bc && S.call !== 'ringing') break;   // 占线撤销只解铃，不打扰拨号/通话
         if (S.call === 'dialing') { ringStop(); stopMic(); S.call = 'idle'; toast('对方拒绝了通话'); refresh(); }
         else if (S.call === 'ringing') { ringStop(); stopMic(); S.call = 'idle'; refresh(); }
         else if (S.call === 'in-call') {
@@ -1111,7 +1129,10 @@
     $('roomInput').disabled = busy;
 
     $('peerCard').classList.toggle('hidden', !S.linked);
+    $('lobbyCard').classList.toggle('hidden', !!S.mode);   // 入房即离大厅：两个视图不再上下叠放
     $('btnCall').disabled = !S.linked || S.call !== 'idle';
+    const hw = $('hostWaiting');
+    if (hw && S.mode === 'host') hw.textContent = S.linked ? '已连接，可邀请更多人' : '等待对方加入…';
 
     $('dialing').classList.toggle('hidden', S.call !== 'dialing');
     $('incoming').classList.toggle('hidden', S.call !== 'ringing');

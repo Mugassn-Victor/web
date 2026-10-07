@@ -14,7 +14,7 @@
     <span id="linkTag" class="tag">未连接</span>
   </header>
 
-  <!-- 大厅：昵称 + 创建/加入房间 -->
+  <!-- 大厅：昵称 + 创建/加入房间（入房后整个隐藏，不与房间视图上下叠放） -->
   <section id="lobbyCard">
     <input id="nickInput" type="text" maxlength="12" placeholder="输入昵称（必填）" autocomplete="off">
     <button id="btnCreate" class="btn primary">创建房间</button>
@@ -23,18 +23,20 @@
       <input id="roomInput" type="text" maxlength="6" placeholder="输入 6 位房间号" autocomplete="off">
       <button id="btnJoin" class="btn">加入房间</button>
     </div>
-
-    <div id="hostPanel" class="hidden">
-      <p class="label">房间号（发给对方）</p>
-      <div class="code-row">
-        <span id="roomCode" class="room-code">------</span>
-        <button id="btnCopy" class="btn small">复制</button>
-      </div>
-      <p class="waiting">等待对方加入…</p>
-    </div>
-
-    <p id="status" class="status"></p>
   </section>
+
+  <!-- 状态行（独立于大厅：入房后的连接提示/错误也可见） -->
+  <p id="status" class="status"></p>
+
+  <!-- 房主：房间号（创建后显示，作为房间视图的头部） -->
+  <div id="hostPanel" class="hidden">
+    <p class="label">房间号（发给对方）</p>
+    <div class="code-row">
+      <span id="roomCode" class="room-code">------</span>
+      <button id="btnCopy" class="btn small">复制</button>
+    </div>
+    <p class="waiting" id="hostWaiting">等待对方加入…</p>
+  </div>
 
   <!-- 对方 / 拨打 -->
   <section id="peerCard" class="hidden">
@@ -71,8 +73,8 @@
       <p class="ov-title">来电…</p>
       <p class="hint" id="incomingPeer">对方邀请通话</p>
       <div class="btn-row">
-        <button id="btnAnswer" class="btn primary">接听</button>
         <button id="btnReject" class="btn danger">拒绝</button>
+        <button id="btnAnswer" class="btn primary">接听</button>
       </div>
     </div>
   </div>
