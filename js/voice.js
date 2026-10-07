@@ -843,10 +843,13 @@
         lastReqKey = rk;
         if (S.call === 'ringing') {
           // 已有来电在响：当前来电者是重发 → 忽略；别人打入 → 占线回执
-          // （新成员拨打通话中/响铃中/拨打中的人，都该收到「对方占线」）
           if (d.sid && callSid && d.sid !== callSid) sendCtl({ t: 'vc-busy', cid: d.cid | 0 });
           return;
         }
+        // 多人房已在通话：新成员拨打 → 立即接受加入（回 vc-ans 让主叫接通，大家一起聊）。
+        // ccid=本通的挂断 cid：加入者自己拨号带的是新号，不认领就没法参与后面的挂断级联
+        // 两人房通话=满员 → 仍回占线；呼叫还没接通（本端拨打中/响铃中）→ 占线
+        if (S.call === 'in-call' && multiMode) { sendCtl({ t: 'vc-ans', cid: d.cid | 0, ccid: callCid }); return; }
         if (S.call !== 'idle') { sendCtl({ t: 'vc-busy', cid: d.cid | 0 }); return; }
         S.call = 'ringing';
         callCid = d.cid | 0;
@@ -875,7 +878,10 @@
       case 'vc-ans':
         try { Net._trace.push((Date.now() % 100000000) + ' vc-ans-recv'); } catch (e) {}
         if (d.cid && d.cid !== callCid) break;   // 上一通的迟到应答
-        if (S.call === 'dialing') startCall();
+        if (S.call === 'dialing') {
+          if (d.ccid) callCid = d.ccid;   // 加入既有通话：改用房间的挂断 cid，之后的挂断级联才认我
+          startCall();
+        }
         break;
       case 'vc-end':
         if (d.cid && d.cid !== callCid) break;   // 陈旧挂断（上一通的重发）：不受理
@@ -1070,8 +1076,6 @@
     try { localStorage.setItem('xqn', S.nick); } catch (e) {}
     S.mode = 'host';
     S.roomId = code;
-    $('roomCode').textContent = code;
-    $('hostPanel').classList.remove('hidden');
     setStatus('正在建立连接…');
     clearRoster();
     initCrypto();
@@ -1103,7 +1107,6 @@
     stopPres();
     clearRoster();
     S.mode = ''; S.roomId = ''; S.linked = false;
-    $('hostPanel').classList.add('hidden');
     refresh();
   }
 
@@ -1130,9 +1133,10 @@
 
     $('peerCard').classList.toggle('hidden', !S.linked);
     $('lobbyCard').classList.toggle('hidden', !!S.mode);   // 入房即离大厅：两个视图不再上下叠放
+    // 房间号常驻右上角：创建/加入都显示（房主和成员一致），点击复制
+    $('roomCode').classList.toggle('hidden', !S.mode);
+    if (S.mode) $('roomCode').textContent = S.roomId || '------';
     $('btnCall').disabled = !S.linked || S.call !== 'idle';
-    const hw = $('hostWaiting');
-    if (hw && S.mode === 'host') hw.textContent = S.linked ? '已连接，可邀请更多人' : '等待对方加入…';
 
     $('dialing').classList.toggle('hidden', S.call !== 'dialing');
     $('incoming').classList.toggle('hidden', S.call !== 'ringing');
@@ -1258,8 +1262,9 @@
   $('roomInput').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') onJoin();
   });
-  $('btnCopy').onclick = function () {
+  $('roomCode').onclick = function () {   // 右上角房间号：点击复制
     const code = $('roomCode').textContent;
+    if (!S.mode || !/^\d{6}$/.test(code)) return;
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(code).then(function () { toast('已复制'); }, function () {});
     } else { toast(code); }

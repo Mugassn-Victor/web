@@ -11,6 +11,7 @@
 <div class="phone">
   <header>
     <h1>语音通话</h1>
+    <span id="roomCode" class="room-code-top hidden" title="点击复制房间号">------</span>
     <span id="linkTag" class="tag">未连接</span>
   </header>
 
@@ -27,16 +28,6 @@
 
   <!-- 状态行（独立于大厅：入房后的连接提示/错误也可见） -->
   <p id="status" class="status"></p>
-
-  <!-- 房主：房间号（创建后显示，作为房间视图的头部） -->
-  <div id="hostPanel" class="hidden">
-    <p class="label">房间号（发给对方）</p>
-    <div class="code-row">
-      <span id="roomCode" class="room-code">------</span>
-      <button id="btnCopy" class="btn small">复制</button>
-    </div>
-    <p class="waiting" id="hostWaiting">等待对方加入…</p>
-  </div>
 
   <!-- 对方 / 拨打 -->
   <section id="peerCard" class="hidden">
