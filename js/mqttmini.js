@@ -140,7 +140,10 @@ MiniMQTT.prototype._feed = function (bytes) {
       this.rxN = (this.rxN | 0) + 1;        // 诊断计数：实际收到的包数
       const tlen = (bytes[bodyStart] << 8) | bytes[bodyStart + 1];
       const topic = this._utf8(bytes.subarray(bodyStart + 2, bodyStart + 2 + tlen));
-      const payload = this._utf8(bytes.subarray(bodyStart + 2 + tlen, bodyEnd));
+      // 0xBE/0xBF 开头 = 二进制音频帧（UTF-8 解码会毁掉字节）；其余按 JSON 文本走
+      const raw = bytes.subarray(bodyStart + 2 + tlen, bodyEnd);
+      const payload = (raw.length && (raw[0] === 0xbe || raw[0] === 0xbf))
+        ? raw.slice() : this._utf8(raw);
       this.onmessage(topic, payload);
     }
     // SUBACK/PINGRESP 等直接跳过
@@ -216,7 +219,7 @@ MiniMQTT.prototype.subscribe = function (topic) {
 MiniMQTT.prototype.publish = function (topic, payload, retain) {
   this.txN = (this.txN | 0) + 1;           // 诊断计数：实际发出的包数
   const t = this._bytes(topic);
-  const p = this._bytes(payload);
+  const p = (payload instanceof Uint8Array) ? payload : this._bytes(payload);   // 二进制载荷直通
   const body = this._u16(t.length).concat(Array.from(t), Array.from(p));
   // header 0x30 = PUBLISH QoS0，retain 位 0x01
   this._send(this._pkt(0x30 + (retain ? 1 : 0), body));

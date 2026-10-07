@@ -19,6 +19,7 @@ const Net = (function () {
   let lastHb = 0;
   let peerGone = false;     // 心跳超时判对方掉线后置位；对方消息再到达时复活心跳并报重连
   let lastPunch = 0;        // 中继模式下背景打洞的节流
+  let punchDelay = 2500;    // 打洞退避：2.5s→5s→8s 封顶，打通后复位
   let relayWanted = false;
   let beaconWanted = false;  // 房主开局后要广播观战信标
   let peerSid = null;        // 对方的总线 sid（只认它的心跳判活，观战者不算对方）
@@ -111,6 +112,10 @@ const Net = (function () {
         startHb();
         emit('reconnected', { role: autoRole, peer: 'p2p' });
       }
+      if (d instanceof ArrayBuffer || d instanceof Uint8Array) {   // 二进制音频帧
+        emit('frame', d instanceof Uint8Array ? d : new Uint8Array(d));
+        return;
+      }
       if (isHb) return;
       deliver(d);
     });
@@ -201,6 +206,17 @@ const Net = (function () {
   function busSend(o, mir) {
     if (!busReady()) { tr('send-skip nobus ' + (o && o.t)); return false; }
     try {
+      if (o instanceof Uint8Array) {
+        // 二进制音频帧：[0xBF][sidLen][sid ascii][0xBE 帧...]（JSON 装字节要再 base64，白烧 33%）
+        tr('sendB');
+        const sid = mqttSig.sid;
+        const env = new Uint8Array(2 + sid.length + o.length);
+        env[0] = 0xbf; env[1] = sid.length;
+        for (let i = 0; i < sid.length; i++) env[2 + i] = sid.charCodeAt(i) & 0xff;
+        env.set(o, 2 + sid.length);
+        mqttSig.mq.publish(mqttSig.topic + '/d', env);
+        return true;
+      }
       tr('send ' + (o && o.t));
       // 带上自己的 sid：broker 会把消息回给发布者本人，收端靠 sid 过滤掉自己发的
       // mir=1 是直连模式的镜像副本：只给观战者收听，对局方收到会丢弃（他们已从直连拿到）
@@ -227,12 +243,16 @@ const Net = (function () {
         // 直连已不可用但总线还在：心跳改走总线，对方一收到就会把双方切回中继
         try { mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'hb', sid: mqttSig.sid })); tr('hb-b'); } catch (e) {}
       }
-      // 背景慢慢打洞：中继模式下房主周期性重发 offer，打通即自动升级直连
+      // 背景慢慢打洞：中继模式下房主周期性重发 offer，打通即自动升级直连。
+      // 指数退避 2.5s→5s→8s 封顶（首轮从 5s 提前到 2.5s，收敛更快），打通后复位
       if (autoRole === 'host' && !hostHealthy() && mqttSig && mqttSig.ensureOffer &&
-          Date.now() - lastPunch >= 5000) {
+          Date.now() - lastPunch >= punchDelay) {
         lastPunch = Date.now();
-        tr('bg-punch');
+        punchDelay = Math.min(8000, punchDelay * 2);
+        tr('bg-punch d=' + punchDelay);
         mqttSig.ensureOffer();
+      } else if (autoRole === 'host' && hostHealthy() && punchDelay !== 2500) {
+        punchDelay = 2500;   // 已打通：下次降级从 2.5s 快速重新收敛
       }
       if (Date.now() - lastHb > HB_MAX) {
         clearHb();
@@ -358,6 +378,7 @@ const Net = (function () {
   function send(obj) {
     if (conn && conn.open) {
       if (conn._relay) return conn.send(obj);   // 中继/观战：走总线，天然广播给观战者
+      if (obj && obj.t) tr('send ' + obj.t);    // 直连控制消息入 trace（心跳/二进制帧不记）
       let ok = false;
       try { conn.send(obj); ok = true; } catch (e) {}
       if (ok) {
@@ -438,12 +459,20 @@ const Net = (function () {
   }
 
   /* ===== 备用信令：公共 MQTT broker（WebSocket 直连，无需注册/自建服务器） ===== */
+  // BROKERS：mqttmini 连接失败时的轮询顺序（连通性兜底）。
+  // PRIMARY_GROUPS：主力组——上层按房间号哈希在「组间」轮转定序、组内按列表顺序
+  // 连接，不在任何组里的条目恒排末尾。换生产 broker 只改这两个列表（上层选路
+  // 不再关心主机名）：主力放组内，限速/不稳定的放组外垫底。
 
   let BROKERS = [
     'wss://broker.emqx.io:8084/mqtt',
     'wss://broker.hivemq.com:8884/mqtt',
     'wss://test.mosquitto.org:8081/mqtt',
     'wss://test.mosquitto.org:8081/'
+  ];
+  const PRIMARY_GROUPS = [
+    ['wss://test.mosquitto.org:8081/mqtt', 'wss://test.mosquitto.org:8081/'],
+    ['wss://broker.hivemq.com:8884/mqtt']
   ];
 
   function stopSigPublishing() {
@@ -499,9 +528,13 @@ const Net = (function () {
     const pub = function (obj) {
       try { mq.publish(topic, JSON.stringify(obj)); } catch (e) {}
     };
+    // offer/answer 配对：每轮 offer 带唯一 oid，应答回显它。房主只认当前轮的应答——
+    // 否则上一轮的陈旧应答会被 setRemote 到新 PC 上，ICE/DTLS 永远起不来，ensure 每
+    // 4s 重建一次形成 conn-close 循环（P2P 卡死不升级的根因）
+    const mkOid = function () { return Math.random().toString(36).slice(2, 8); };
     const publishOffer = function () {
       // 中继模式下也继续发布：供背景打洞的 offer/answer 交换用
-      if (st.offer && !st.done && (!settled || (conn && conn._relay))) pub({ k: 'o', sd: st.offer, sid: st.sid });
+      if (st.offer && !st.done && (!settled || (conn && conn._relay))) pub({ k: 'o', sd: st.offer, sid: st.sid, oid: st.lastOid });
     };
     // 观战：收到房里任何人的消息即确认房间存在 → 入房
     const watchFound = function () {
@@ -541,9 +574,13 @@ const Net = (function () {
           st.ensuring = false;
           if (st.done || mqttSig !== st) return;
           st.offer = code;
+          st.lastOid = mkOid();
           publishOffer();
         }).catch(function () { st.ensuring = false; });
-        st.timers.push(setInterval(publishOffer, 1000));
+        // 信令周期 3s（原 1s）：首轮 offer/敲门都是即时发的、应答也是事件驱动，
+        // 周期只负责丢包重试/重连兜底；通话中信标+应答+offer 叠加音频 ~10/s ≈ 11/s，
+        // 压到 mosquitto ~15/s 限速以下（1s 周期时拨号瞬间 ~16/s，中继送达 ~94%）
+        st.timers.push(setInterval(publishOffer, 3000));
 
         // 兜底重连：对方刷新页面后重进会先「敲门」，此时房主若在中继/掉线状态
         // （对方早已收不到周期 offer），要重新生成 offer、放开应答闸，让对方接回
@@ -567,15 +604,16 @@ const Net = (function () {
             st.ensuring = false;
             if (st.done || dead || mqttSig !== st) return;
             st.offer = code;
+            st.lastOid = mkOid();
             st.accepted = false;                           // 放开应答闸：接受新一轮 answer
-            pub({ k: 'o', sd: code, sid: st.sid });
+            pub({ k: 'o', sd: code, sid: st.sid, oid: st.lastOid });
             if (!st.offerTimer) {
               st.offerTimer = setInterval(function () {
                 if (st.done || hostHealthy()) {
                   clearInterval(st.offerTimer); st.offerTimer = null; return;
                 }
-                if (st.offer) pub({ k: 'o', sd: st.offer, sid: st.sid });
-              }, 1000);
+                if (st.offer) pub({ k: 'o', sd: st.offer, sid: st.sid, oid: st.lastOid });
+              }, 3000);
               st.timers.push(st.offerTimer);
             }
           }).catch(function () { st.ensuring = false; });
@@ -595,14 +633,36 @@ const Net = (function () {
         st.timers.push(setInterval(function () {
           // 中继模式下也继续发：背景打洞靠它触发房主重发 offer / 传应答码
           if (st.done || (settled && !(conn && conn._relay))) return;
-          if (st.answer) pub({ k: 'a', sd: st.answer, sid: st.sid });
+          if (st.answer) pub({ k: 'a', sd: st.answer, sid: st.sid, oid: st.answerOid });
           else knock();
-        }, 1000));
+        }, 3000));   // 与房主 offer 同步降频（见 publishOffer 处注释）
       }
     };
 
     mq.onmessage = function (t, payload) {
       if (st.done || dead) { if (t === dataTopic) tr('dt-drop ' + (dead ? 'dead' : 'done')); return; }
+      if (payload instanceof Uint8Array) {          // 二进制音频中继包 [0xBF][sidLen][sid][帧]
+        if (t !== dataTopic) return;
+        dAllN++;
+        if (payload.length < 4 || payload[0] !== 0xbf) { badN++; return; }
+        const sl = payload[1];
+        let sid = '';
+        for (let i = 0; i < sl; i++) sid += String.fromCharCode(payload[2 + i]);
+        if (sid === st.sid) { dOwnN++; return; }    // broker 回给发布者本人的回声
+        const fromPeerF = !peerSid || sid === peerSid;
+        if (fromPeerF) lastHb = Date.now();         // 收到对方音频帧 = 对方活着
+        if (peerGone && autoRole !== 'watch' && fromPeerF) {
+          peerGone = false;
+          tr('hb-revive');
+          startHb();
+          emit('reconnected', { role: autoRole, peer: 'relay' });
+        }
+        const frame = payload.subarray(2 + sl);
+        if (frame.length < 9 || frame[0] !== 0xbe) { badN++; return; }
+        dlvN++;
+        emit('frame', frame);
+        return;
+      }
       let m;
       try { m = JSON.parse(payload); } catch (e) { badN++; return; }
       if (t === dataTopic) {
@@ -718,16 +778,20 @@ const Net = (function () {
       }
       if (typeof m.sd !== 'string') return;
       if (awaitRole && role === 'guest') { tr('sd-defer'); return; }   // 等身份期间不碰 offer/answer
-      if (role === 'host' && m.k === 'a' && !st.accepted) {
-        tr('ans-recv');
-        st.accepted = true;
-        manualAccept(m.sd).then(function () { tr('accept-ok'); startP2pTimer('host'); })
-          .catch(function (e) {
-            // 应答已应用过（stable 上再 setRemote）→ 视为已接受，别让重复应答反复重试
-            if (e && String(e).indexOf('wrong state: stable') >= 0) st.accepted = true;
-            else st.accepted = false;
-            tr('accept-err ' + e);
-          });
+      if (role === 'host' && m.k === 'a') {
+        // 陈旧应答配对闸：只认当前轮 offer 的应答（oid 缺失=旧版，放行保兼容）
+        if (m.oid && st.lastOid && m.oid !== st.lastOid) { tr('ans-drop stale'); return; }
+        if (!st.accepted) {
+          tr('ans-recv');
+          st.accepted = true;
+          manualAccept(m.sd).then(function () { tr('accept-ok'); startP2pTimer('host'); })
+            .catch(function (e) {
+              // 应答已应用过（stable 上再 setRemote）→ 视为已接受，别让重复应答反复重试
+              if (e && String(e).indexOf('wrong state: stable') >= 0) st.accepted = true;
+              else st.accepted = false;
+              tr('accept-err ' + e);
+            });
+        }
       } else if (role === 'guest' && m.k === 'o') {
         // 先中继连上（'hi' 丢失时的兜底），打洞照常在背景走
         if (!settled) relayConnect('guest');
@@ -738,13 +802,14 @@ const Net = (function () {
         if (st.answer && st.lastOffer === m.sd) { tr('offer-drop same'); return; }
         tr('offer-recv');
         st.lastOffer = m.sd;
+        st.answerOid = m.oid || null;      // 回显当前 offer 的配对 id，供房主过滤陈旧应答
         st.answering = true;
         manualAnswer(m.sd).then(function (code) {
           st.answering = false;
           st.answer = code;
           startP2pTimer('guest');
           tr('ans-pub');
-          pub({ k: 'a', sd: code, sid: st.sid });
+          pub({ k: 'a', sd: code, sid: st.sid, oid: st.answerOid });
         }).catch(function (e) { tr('ans-err ' + e); st.answering = false; st.lastOffer = null; });
       }
     };
@@ -824,15 +889,20 @@ const Net = (function () {
   }
 
   function attachManual(dc, role) {
+    dc.binaryType = 'arraybuffer';   // 二进制音频帧以 ArrayBuffer 落地（默认 Blob 异步不可用）
     const wrap = {
       peer: 'manual-' + role,
       _pc: mpc,
       get open() { return dc.readyState === 'open'; },
-      send: function (o) { if (dc.readyState === 'open') dc.send(JSON.stringify(o)); },
+      send: function (o) {
+        if (dc.readyState !== 'open') return;
+        dc.send(o instanceof Uint8Array ? o : JSON.stringify(o));
+      },
       close: function () { try { dc.close(); } catch (e) {} },
       on: function (evt, fn) {
         if (evt === 'data') {
           dc.addEventListener('message', function (e) {
+            if (typeof e.data !== 'string') { fn(e.data); return; }   // 二进制帧直通
             try { fn(JSON.parse(e.data)); } catch (err) { fn(e.data); }
           });
         } else {
@@ -858,6 +928,7 @@ const Net = (function () {
     mpcSince = Date.now();
     watchIce(mpc);
     mdc = mpc.createDataChannel('xq', { ordered: true });
+    mdc.binaryType = 'arraybuffer';
     return mpc.createOffer()
       .then(function (o) { return mpc.setLocalDescription(o); })
       .then(function () { return waitGathering(mpc, 1500); })
@@ -892,6 +963,7 @@ const Net = (function () {
     watchIce(mpc);
     mpc.ondatachannel = function (e) {
       mdc = e.channel;
+      mdc.binaryType = 'arraybuffer';
       attachManual(mdc, 'guest');
     };
     return mpc.setRemoteDescription({ type: d.t, sdp: d.s })
@@ -916,8 +988,11 @@ const Net = (function () {
     signalingPending: signalingPending,
     resume: resume,
     setInGame: setInGame,
-    // broker 选路：上层启动时实测各端点回环 RTT 后重排（下一次连接生效）
+    // broker 选路：上层按房间号哈希从 PRIMARY_GROUPS 推导确定性顺序（两端一致）
     brokerList: function () { return BROKERS.slice(); },
+    brokerPrimaryGroups: function () {
+      return PRIMARY_GROUPS.map(function (g) { return g.slice(); });
+    },
     setBrokerOrder: function (arr) {
       if (!arr || !arr.length) return;
       const keep = BROKERS.filter(function (u) { return arr.indexOf(u) < 0; });
