@@ -14,8 +14,9 @@
     <span id="linkTag" class="tag">未连接</span>
   </header>
 
-  <!-- 大厅：创建/加入房间 -->
+  <!-- 大厅：昵称 + 创建/加入房间 -->
   <section id="lobbyCard">
+    <input id="nickInput" type="text" maxlength="12" placeholder="输入昵称（必填）" autocomplete="off">
     <button id="btnCreate" class="btn primary">创建房间</button>
     <div class="divider"><span>或</span></div>
     <div class="join-row">
@@ -45,6 +46,12 @@
       </div>
     </div>
     <button id="btnCall" class="btn primary big" disabled>拨打</button>
+  </section>
+
+  <!-- 房间成员（昵称 + 正在说话高亮） -->
+  <section id="rosterCard" class="hidden">
+    <p class="label">房间成员</p>
+    <ul id="rosterList"></ul>
   </section>
 
   <!-- 通话中 -->

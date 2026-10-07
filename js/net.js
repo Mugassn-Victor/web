@@ -23,7 +23,24 @@ const Net = (function () {
   let relayWanted = false;
   let beaconWanted = false;  // 房主开局后要广播观战信标
   let peerSid = null;        // 对方的总线 sid（只认它的心跳判活，观战者不算对方）
+  let dcSid = null;          // 直连通道对端的总线 sid（帧归属用：bus peerSid 会被第三方心跳拨动）
   let pendingData = [];     // 连接建立前收到的消息，先缓存
+  let multiMode = false;     // 房间 ≥3 人：主通道锁总线；同时按需建立两两 mesh 直连（混合网状）
+  let openRoom = false;      // 语音房：不设两人上限（敲门永远放行，不回 full/ask）
+  let rttEma = 0;            // 链路往返时延：hb 带时间戳、对端回声，EMA 平滑
+  /* ===== 多人 mesh（混合网状）：能打通的对走点对点，打不通的对继续走总线 =====
+     主通道 conn 在多人房恒为总线 wrap（控制消息全走它广播，保证全员必达）；
+     meshConns[sid] 是与单个成员的点对点数据通道，音频帧优先走它。只要还有
+     成员没打通（或成员在场表未收齐），音频同时走总线兜底（收端按帧序号去重）。 */
+  const meshConns = {};      // sid -> 点对点通道（manual wrap：每对一条 RTCPeerConnection）
+  const meshPC = {};         // sid -> {pc, dc?, role:'off'|'ans', oid, t}（mesh 信令在途状态）
+  const meshTry =  {};       // sid -> 下次允许发起连接的时间戳（拨号节流 6s）
+  const meshLast = {};       // sid -> 最近从该通道收到数据的时间（半开判死用）
+  const pids = {};           // sid -> 对端 peerjs id（总线消息捎带学习，拨号用）
+  const pidToSid = {};       // 反查：peerjs id -> sid（入站连接认领对端用）
+  const peers = {};          // sid -> 最近出现在总线上的时间（成员在场表，9s 过期）
+  const MESH_RETRY = 6000;   // mesh 拨号重试间隔
+  const mx = { d: 0, mp: 0, mr: 0, ap: 0, ar: 0, ac: 0, er: 0 };   // mesh 信令诊断计数
   const handlers = {};
 
   const P2P_WAIT = 10000;   // 信令交换完成后等 P2P 的时间
@@ -41,7 +58,13 @@ const Net = (function () {
   }
 
   function on(evt, fn) { handlers[evt] = fn; }
-  function emit(evt, data) { if (handlers[evt]) handlers[evt](data); }
+  function emit(evt, data, extra) { if (handlers[evt]) handlers[evt](data, extra); }   // extra=帧归属 sid（仅 frame 用）
+
+  // RTT 采样：对端 hbr 带回我方 hb 的发送时刻（30s 外的陈旧值丢弃），EMA 平滑
+  function rttSample(t) {
+    const dt = Date.now() - t;
+    if (dt > 0 && dt < 30000) rttEma = rttEma ? (rttEma * 0.75 + dt * 0.25) : dt;
+  }
 
   function isWrappedMpc(c) { return !!(mpc && c && c._pc === mpc); }
   function busReady() {
@@ -63,9 +86,321 @@ const Net = (function () {
     for (let i = 0; i < q.length; i++) emit('data', q[i]);
   }
 
+  /* ===== mesh 成员在场表 + 点对点通道管理 ===== */
+
+  // 成员在场记录：总线任意消息（信令/心跳/控制）都捎带学习 sid 与 peerjs id。
+  // 在场表是音频「走不走总线」的判据——还有成员没进表或没打通就必须广播兜底
+  function notePeer(sid, pid, now) {
+    if (!sid || (mqttSig && sid === mqttSig.sid)) return;
+    peers[sid] = now || Date.now();
+    if (pid && pids[sid] !== pid) { pids[sid] = pid; pidToSid[pid] = sid; }
+  }
+
+  // 是否全员点对点打通（peers 为空视为未知 → 必须走总线）
+  function fullMesh() {
+    const sids = Object.keys(peers);
+    if (!sids.length) return false;
+    for (let i = 0; i < sids.length; i++) {
+      const c = meshConns[sids[i]];
+      if (!c || !c.open) return false;
+    }
+    return true;
+  }
+
+  function openMeshCount() {
+    let n = 0;
+    const sids = Object.keys(meshConns);
+    for (let i = 0; i < sids.length; i++) { const c = meshConns[sids[i]]; if (c && c.open) n++; }
+    return n;
+  }
+
+  // 入站/出站通道按 sid 认领入册；同对已有通道时按「sid 小的一方发起」收敛
+  //（两边用同一判据且互补 → 必然收敛到同一条，杜绝双通道双倍音频）
+  function promoteMesh(sid, c) {
+    if (!sid || !c) return;
+    const old = meshConns[sid];
+    if (old && old !== c) {
+      if (!old.open) {
+        try { old.close(); } catch (e) {}
+      } else {
+        const my = (mqttSig && mqttSig.sid) || '';
+        const keepMine = (my < sid) === !!c._dialed;
+        const keepOld = (my < sid) === !!old._dialed;
+        if (keepOld && !keepMine) { try { c.close(); } catch (e) {} return; }
+        if (!keepOld && !keepMine) { try { old.close(); } catch (e) {} }   // 同向双拨（防御）：留新的
+        else if (keepMine) { try { old.close(); } catch (e) {} }
+      }
+    }
+    if (meshConns[sid] === c) return;
+    meshConns[sid] = c;
+    c._sid = sid;
+    tr('mesh-promote ' + sid + ' dialed=' + (c._dialed ? 1 : 0));
+  }
+
+  function dropMesh(sid, c) {
+    if (sid && meshConns[sid] === c) {
+      delete meshConns[sid];
+      tr('mesh-drop ' + sid);
+    }
+    if (sid) { meshLast[sid] = 0; meshTry[sid] = Date.now() + MESH_RETRY; }
+  }
+
+  // 把一条点对点通道收编为 mesh：挂数据/生命周期监听、开放即互发心跳认领 sid
+  function meshAdopt(c, hintSid, dialed) {
+    if (!c || c._relay || c._mesh || dead) return;
+    c._mesh = true;
+    c._dialed = !!dialed;
+    let sid = hintSid || null;
+    if (!sid && c.peer && pidToSid[c.peer]) sid = pidToSid[c.peer];
+    let fixed = false;
+    const attr = function (s) {
+      if (!s || (mqttSig && s === mqttSig.sid)) return;
+      if (fixed) return;
+      if (sid && s !== sid) return;
+      sid = s; fixed = true; c._sid = s;
+      promoteMesh(s, c);
+    };
+    c.on('data', function (d) {
+      if (dead) return;
+      // 二进制帧判断必须在最前：ArrayBuffer/Uint8Array 的 typeof 也是 'object'，
+      // 放在对象分支后面会被当成控制消息吞掉（mesh 音频全丢的根因）
+      const b = d instanceof Uint8Array ? d : (d instanceof ArrayBuffer ? new Uint8Array(d) : null);
+      if (b) {
+        if (!c._sid) { mx.fns = (mx.fns | 0) + 1; tr('mesh-frame-nosid'); return; }   // 抢在心跳认领前：丢帧由预缓冲吸收
+        mx.frx = (mx.frx | 0) + 1;
+        meshLast[sid || c._sid] = Date.now();
+        emit('frame', b, c._sid);
+        return;
+      }
+      if (d && typeof d === 'object') {
+        if (d.k === 'hb') {
+          if (d.sid) attr(d.sid);
+          if (sid) meshLast[sid] = Date.now();
+          if (d.t) { try { c.send({ k: 'hbr', t: d.t, sid: (mqttSig && mqttSig.sid) || undefined }); } catch (e) {} }
+          return;
+        }
+        if (d.k === 'hbr') {
+          if (d.sid) attr(d.sid);
+          if (sid) meshLast[sid] = Date.now();
+          if (d.t) rttSample(d.t);
+          return;
+        }
+        // 非心跳的控制消息：正常多人房控制走总线广播，这里收到只可能是
+        // 「本端已回两人房、对端还停在多人态」的过渡窗口 → 交付，防丢
+        if (sid) meshLast[sid] = Date.now();
+        deliver(d);
+        return;
+      }
+    });
+    c.on('close', function () { dropMesh(c._sid || sid, c); });
+    c.on('error', function () { try { c.close(); } catch (e) {} dropMesh(c._sid || sid, c); });
+    const kick = function () {
+      if (dead) return;
+      tr('mesh-open ' + (sid || c.peer || '?') + ' dialed=' + (dialed ? 1 : 0));
+      attr(sid || (c.peer && pidToSid[c.peer]) || null);
+      if (sid) { meshLast[sid] = Date.now(); meshTry[sid] = 0; }
+      try { c.send({ k: 'hb', sid: (mqttSig && mqttSig.sid) || undefined, t: Date.now() }); } catch (e) {}
+      meshTryAll();
+    };
+    if (hintSid) attr(hintSid);   // 手动信令收发双方都确切知道对端 sid：立即认领
+    if (c.open) setTimeout(kick, 0);
+    else c.on('open', kick);
+  }
+
+  // 对每个在场成员发起 mesh 拨号（仅 sid 小的一方发起 offer，防双方对撞；
+  // 信令走总线 sig topic 的 to 寻址 —— 本应用无 PeerJS，P2P 全靠手动 SDP 交换）
+  function maybeMesh(targetSid) {
+    if (!multiMode || dead || autoRole === 'watch') return;
+    if (!targetSid || (mqttSig && targetSid === mqttSig.sid)) return;
+    if (meshConns[targetSid] && meshConns[targetSid].open) return;
+    if (meshPC[targetSid]) return;                // 信令在途：等开通道，超时由 sweepMesh 清理
+    const now = Date.now();
+    if (meshTry[targetSid] && now < meshTry[targetSid]) return;
+    if (!(mqttSig && mqttSig.sid < targetSid)) return;
+    if (!mqttSig || !mqttSig.mq || !mqttSig.mq._opened) return;
+    meshTry[targetSid] = now + MESH_RETRY;
+    mx.d++;
+    tr('mesh-dial ' + targetSid);
+    meshDial(targetSid);
+  }
+
+  function meshTryAll() {
+    if (!multiMode || dead) return;
+    const sids = Object.keys(peers);
+    for (let i = 0; i < sids.length; i++) maybeMesh(sids[i]);
+  }
+
+  // 半开/静默死链判死：超过 HB_MAX 没动静 → 关掉回退总线（下一帧自动恢复广播）
+  function sweepMesh() {
+    const now = Date.now();
+    const sids = Object.keys(peers);
+    for (let i = 0; i < sids.length; i++) if (now - peers[sids[i]] > 9000) delete peers[sids[i]];
+    const ms = Object.keys(meshConns);
+    for (let i = 0; i < ms.length; i++) {
+      const s = ms[i], c = meshConns[s];
+      if (!c) continue;
+      if (meshLast[s] && now - meshLast[s] > HB_MAX) {
+        tr('mesh-timeout ' + s);
+        try { c.close(); } catch (e) {}
+        dropMesh(s, c);
+      }
+    }
+    // 信令挂起超时（答案丢失 / 通道未开且 ICE 静默停在 new）：连同已收编的
+    // 未打开通道一并清理，否则 meshPC/meshConns 互相死锁、永不再拨
+    const ps = Object.keys(meshPC);
+    for (let i = 0; i < ps.length; i++) {
+      const s = ps[i], e = meshPC[s];
+      const mc = meshConns[s];
+      if (e && !(mc && mc.open) && now - e.t > 15000) {
+        tr('mesh-pc-timeout ' + s);
+        if (mc) { try { mc.close(); } catch (er) {} dropMesh(s, mc); }
+        try { if (e.dc) e.dc.close(); } catch (er) {}
+        try { if (e.pc) e.pc.close(); } catch (er) {}
+        delete meshPC[s];
+        meshTry[s] = now + MESH_RETRY;
+      }
+    }
+  }
+
+  function closeAllMesh() {
+    const ms = Object.keys(meshConns);
+    for (let i = 0; i < ms.length; i++) {
+      const c = meshConns[ms[i]];
+      try { if (c) c.close(); } catch (e) {}
+      delete meshConns[ms[i]];
+      meshLast[ms[i]] = 0;
+    }
+    const ps = Object.keys(meshPC);
+    for (let i = 0; i < ps.length; i++) {
+      const e = meshPC[ps[i]];
+      try { if (e && e.dc) e.dc.close(); } catch (er) {}
+      try { if (e && e.pc) e.pc.close(); } catch (er) {}
+      delete meshPC[ps[i]];
+    }
+  }
+
+  /* ---- mesh 手动信令：SDP 经 sig topic 以 to:sid 寻址交换（每对一条 RTCPeerConnection） ---- */
+
+  function sigPub(o) {
+    if (!mqttSig || !mqttSig.mq || !mqttSig.mq._opened) return;
+    try { mqttSig.mq.publish(mqttSig.topic, JSON.stringify(o)); } catch (e) {}
+  }
+
+  function watchMeshIce(sid, pc) {
+    if (!pc || !pc.addEventListener) return;
+    pc.addEventListener('iceconnectionstatechange', function () {
+      const s = pc.iceConnectionState;
+      if (s !== 'failed') return;   // disconnected 常为暂态：留给 mesh 心跳判死
+      tr('mesh-ice-fail ' + sid);
+      const ent = meshPC[sid];
+      if (ent && ent.pc === pc) { delete meshPC[sid]; meshTry[sid] = Date.now() + MESH_RETRY; }
+      try { pc.close(); } catch (e) {}
+      dropMesh(sid, meshConns[sid]);
+    });
+  }
+
+  // 发起方：独立 PC + DC，offer 打包发给目标 sid（只有自己被 accept 后通道才开）
+  function meshDial(targetSid) {
+    const pc = new RTCPeerConnection({ iceServers: ICE });
+    const dc = pc.createDataChannel('xq', { ordered: true });
+    dc.binaryType = 'arraybuffer';
+    const oid = Math.random().toString(36).slice(2, 8);
+    const ent = { pc: pc, dc: dc, role: 'off', oid: oid, t: Date.now() };
+    meshPC[targetSid] = ent;
+    watchMeshIce(targetSid, pc);
+    const fail = function (e) {
+      tr('mesh-dial-err ' + e);
+      mx.er++;
+      if (meshPC[targetSid] === ent) delete meshPC[targetSid];
+      try { dc.close(); } catch (er) {}
+      try { pc.close(); } catch (er) {}
+      meshTry[targetSid] = Date.now() + MESH_RETRY;
+      dropMesh(targetSid, meshConns[targetSid]);
+    };
+    pc.createOffer()
+      .then(function (o) { return pc.setLocalDescription(o); })
+      .then(function () { return waitGathering(pc, 1500); })
+      .then(function () {
+        if (meshPC[targetSid] !== ent || !pc.localDescription) return;
+        const w = mkManualWrap(dc, pc, 'host');
+        meshAdopt(w, targetSid, true);   // 先挂监听等 open（answer 应用 + ICE + DTLS 后触发）
+        sigPub({ k: 'mo', to: targetSid, sid: mqttSig.sid, oid: oid,
+                 sd: enc({ t: pc.localDescription.type, s: pc.localDescription.sdp }) });
+        mx.mp++;
+        tr('mesh-mo-pub ' + targetSid);
+      })
+      .catch(fail);
+  }
+
+  // 收 offer（应答方）/ 收 answer（发起方）。to 寻址 + sid 对比防对撞：
+  // 只有「sid 较小方发出的 offer」被受理，与本端在途的反向拨号必然收敛到同一条
+  function onMeshSdp(m) {
+    if (!multiMode || dead || autoRole === 'watch') return;
+    if (!m || m.to !== (mqttSig && mqttSig.sid) || !m.sid) return;
+    const fromSid = m.sid;
+    if (m.k === 'mo') {
+      mx.mr++;
+      if (mqttSig.sid < fromSid) { tr('mesh-mo-ignore ' + fromSid); return; }   // 本端才是发起方
+      const ex = meshPC[fromSid];
+      if (ex) {
+        try { if (ex.dc) ex.dc.close(); } catch (er) {}
+        try { if (ex.pc) ex.pc.close(); } catch (er) {}
+        delete meshPC[fromSid];
+      }
+      let d; try { d = dec(m.sd); } catch (e) { tr('mesh-mo-bad'); return; }
+      if (!d.s || d.s.indexOf('m=application') < 0) return;
+      const pc = new RTCPeerConnection({ iceServers: ICE });
+      const ent = { pc: pc, role: 'ans', oid: m.oid || null, t: Date.now() };
+      meshPC[fromSid] = ent;
+      watchMeshIce(fromSid, pc);
+      pc.ondatachannel = function (e) {
+        tr('mesh-dc-in ' + fromSid);
+        const w = mkManualWrap(e.channel, pc, 'guest');
+        meshAdopt(w, fromSid, false);
+      };
+      pc.setRemoteDescription({ type: d.t, sdp: d.s })
+        .then(function () { return pc.createAnswer(); })
+        .then(function (a) { return pc.setLocalDescription(a); })
+        .then(function () { return waitGathering(pc, 1000); })
+        .then(function () {
+          if (meshPC[fromSid] !== ent || !pc.localDescription) return;
+          sigPub({ k: 'ma', to: fromSid, sid: mqttSig.sid, oid: ent.oid,
+                   sd: enc({ t: pc.localDescription.type, s: pc.localDescription.sdp }) });
+          mx.ap++;
+          tr('mesh-ma-pub ' + fromSid);
+        })
+        .catch(function (e) {
+          tr('mesh-ma-err ' + e);
+          mx.er++;
+          if (meshPC[fromSid] === ent) delete meshPC[fromSid];
+          try { pc.close(); } catch (er) {}
+        });
+      return;
+    }
+    if (m.k === 'ma') {
+      mx.ar++;
+      const ent = meshPC[fromSid];
+      if (!ent || ent.role !== 'off') { tr('mesh-ma-nopair'); return; }
+      if (m.oid && ent.oid && m.oid !== ent.oid) { tr('mesh-ma-stale'); return; }
+      if (ent.answering) return;
+      ent.answering = true;
+      let d; try { d = dec(m.sd); } catch (e) { ent.answering = false; return; }
+      ent.pc.setRemoteDescription({ type: d.t, sdp: d.s })
+        .then(function () { mx.ac++; tr('mesh-acc ' + fromSid); })
+        .catch(function (e) { ent.answering = false; mx.er++; tr('mesh-acc-err ' + e); });
+    }
+  }
+
   // 第一条可用传输获胜：P2P 打开即用；中继模式下后打通的 P2P 可无缝升级
   function fireConnected(c, role) {
     if (dead) return;
+    if (multiMode && c && !c._relay) {
+      // 多人房：迟到/过渡的直连通道不当主通道（主通道恒为总线 wrap），
+      // 转收编为与该成员的 mesh 点对点链路——音频帧的低延迟通路
+      if (c._mesh) return;
+      meshAdopt(c, null, false);
+      return;
+    }
     if (settled) {
       if (c === conn) return;
       const healthy = conn && conn.open;
@@ -97,13 +432,15 @@ const Net = (function () {
   }
 
   function setupConn(c, role) {
+    // 多人房里的点对点通道（入站或过渡窗口建立）→ 直接收编为 mesh，不进主通道竞选
+    if (multiMode && c && !c._relay && !c._mesh) { meshAdopt(c, null, false); return; }
     // 监听必须先挂上（含接管场景）：对方刷新重连时旧连接已死，新连接会被 fireConnected
     // 接管成 conn，若此时没挂 data 监听，接管后就永远收不到对方消息（c===conn 守卫无处生效）
     c.on('data', function (d) {
       if (c !== conn) return;
       // 直连心跳/来包 = 对方活着：刷新判活计时；判死后收到即复活上报重连
       const isHb = !!(d && typeof d === 'object' && d.k === 'hb');
-      if (isHb && d.sid) peerSid = d.sid;
+      if (isHb && d.sid) { peerSid = d.sid; dcSid = d.sid; }
       if (!isHb) tr('recv-d');
       lastHb = Date.now();
       if (peerGone) {
@@ -113,10 +450,15 @@ const Net = (function () {
         emit('reconnected', { role: autoRole, peer: 'p2p' });
       }
       if (d instanceof ArrayBuffer || d instanceof Uint8Array) {   // 二进制音频帧
-        emit('frame', d instanceof Uint8Array ? d : new Uint8Array(d));
+        emit('frame', d instanceof Uint8Array ? d : new Uint8Array(d), dcSid || undefined);
         return;
       }
-      if (isHb) return;
+      if (isHb) {
+        // 带时间戳的心跳 → 立即回声（直连 RTT 探针；带 sid 供对端认领帧归属）
+        if (d.t) { try { c.send({ k: 'hbr', t: d.t, sid: (mqttSig && mqttSig.sid) || undefined }); } catch (e) {} }
+        return;
+      }
+      if (d && d.k === 'hbr') { if (d.t) rttSample(d.t); return; }
       deliver(d);
     });
     c.on('close', function () {
@@ -219,33 +561,51 @@ const Net = (function () {
       }
       tr('send ' + (o && o.t));
       // 带上自己的 sid：broker 会把消息回给发布者本人，收端靠 sid 过滤掉自己发的
+      // pid 捎带自己的 peerjs id：mesh 拨号要按 sid→pid 认目标（收端 notePeer 学习）
       // mir=1 是直连模式的镜像副本：只给观战者收听，对局方收到会丢弃（他们已从直连拿到）
-      const pkt = { k: 'm', d: o, sid: mqttSig.sid };
+      const pkt = { k: 'm', d: o, sid: mqttSig.sid, pid: (peer && peer.id) || undefined };
       if (mir) pkt.mir = 1;
       mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify(pkt));
       return true;
     } catch (e) { tr('send-err ' + e); return false; }
   }
 
+  function sendHb() {
+    const t = Date.now();
+    // mesh 点对点通道逐条测活（半开通道不触发事件，只有回音判得出死活）
+    const ms = Object.keys(meshConns);
+    for (let i = 0; i < ms.length; i++) {
+      const mc = meshConns[ms[i]];
+      if (mc && mc.open) {
+        try { mc.send({ k: 'hb', sid: (mqttSig && mqttSig.sid) || undefined, t: t }); } catch (e) {}
+      }
+    }
+    if (!conn) return;
+    if (conn._relay) {
+      if (busReady()) {
+        try { mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'hb', sid: mqttSig.sid, t: t, pid: (peer && peer.id) || undefined })); tr('hb-s'); } catch (e) {}
+      }
+    } else if (conn.open) {
+      // 直连也要测活：半开通道不会触发任何事件，收不到回音只有靠它判死
+      try { conn.send({ k: 'hb', sid: (mqttSig && mqttSig.sid) || undefined, t: t }); tr('hb-p'); } catch (e) {}
+    } else if (busReady()) {
+      // 直连已不可用但总线还在：心跳改走总线，对方一收到就会把双方切回中继
+      try { mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'hb', sid: mqttSig.sid, t: t, pid: (peer && peer.id) || undefined })); tr('hb-b'); } catch (e) {}
+    }
+  }
+
   function startHb() {
     lastHb = Date.now();
     if (hbTimer) return;
+    sendHb();                             // 立即打一发：链路刚建立就拿到首个 RTT 样本（延迟显示不用等 3s）
     hbTimer = setInterval(function () {
       if (!settled || !conn || autoRole === 'watch') { clearHb(); return; }
-      if (conn._relay) {
-        if (busReady()) {
-          try { mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'hb', sid: mqttSig.sid })); tr('hb-s'); } catch (e) {}
-        }
-      } else if (conn.open) {
-        // 直连也要测活：半开通道不会触发任何事件，收不到回音只有靠它判死
-        try { conn.send({ k: 'hb', sid: (mqttSig && mqttSig.sid) || undefined }); tr('hb-p'); } catch (e) {}
-      } else if (busReady()) {
-        // 直连已不可用但总线还在：心跳改走总线，对方一收到就会把双方切回中继
-        try { mqttSig.mq.publish(mqttSig.topic + '/d', JSON.stringify({ k: 'hb', sid: mqttSig.sid })); tr('hb-b'); } catch (e) {}
-      }
+      sendHb();
+      if (multiMode) { sweepMesh(); meshTryAll(); }   // mesh：过期清理 + 未打通的按节流重试
       // 背景慢慢打洞：中继模式下房主周期性重发 offer，打通即自动升级直连。
-      // 指数退避 2.5s→5s→8s 封顶（首轮从 5s 提前到 2.5s，收敛更快），打通后复位
-      if (autoRole === 'host' && !hostHealthy() && mqttSig && mqttSig.ensureOffer &&
+      // 指数退避 2.5s→5s→8s 封顶（首轮从 5s 提前到 2.5s，收敛更快），打通后复位。
+      // 多人房不打洞（全员锁中继），回到两人房才恢复
+      if (autoRole === 'host' && !multiMode && !hostHealthy() && mqttSig && mqttSig.ensureOffer &&
           Date.now() - lastPunch >= punchDelay) {
         lastPunch = Date.now();
         punchDelay = Math.min(8000, punchDelay * 2);
@@ -294,11 +654,17 @@ const Net = (function () {
   function newPeer(id) {
     if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
     peer = new Peer(id);
-    peer.on('open', function (myId) { emit('open', myId); });
+    peer.on('open', function (myId) {
+      emit('open', myId);
+      // 多人房重建 Peer 后立刻发心跳捎带自己的 peerjs id，让对端尽快学到拨号目标
+      if (multiMode) sendHb();
+    });
     peer.on('error', function (e) { emit('error', e); });
     peer.on('disconnected', function () {
       try { peer.reconnect(); } catch (e) {}
     });
+    // 入站连接统一入口：两人房进主通道竞选；多人房在 setupConn 里收编为 mesh
+    peer.on('connection', function (c) { setupConn(c, autoRole || 'guest'); });
     return peer;
   }
 
@@ -309,14 +675,16 @@ const Net = (function () {
     autoRole = 'host';
     awaitRole = false;
     inGame = false;   // 新建的是空房：清掉上一局残留，否则敲门者会被误问「缺位身份」
+    multiMode = false;
     lastRoom = roomId;
     lastAs = null;
     peerSid = null;
+    dcSid = null;
     pendingData = [];
+    closeAllMesh();
     startMqttSig(roomId, 'host');
     if (typeof Peer === 'undefined') return;
-    const p = newPeer(roomId);
-    p.on('connection', function (c) { setupConn(c, 'host'); });
+    newPeer(roomId);   // 入站连接监听挂在 newPeer 里（与客方统一）
   }
 
   // 加房；asPlayer=true 表示对方已明确选择「以对战方加入」
@@ -324,10 +692,13 @@ const Net = (function () {
     dead = false;
     settled = false;
     autoRole = 'guest';
+    multiMode = false;
     lastRoom = roomId;
     lastAs = asPlayer ? 'p' : null;
     peerSid = null;
+    dcSid = null;
     pendingData = [];
+    closeAllMesh();
     // 没明确要下棋就先等房主表态（'hi'=正常放行 / 'ask'=缺位先选身份），
     // 期间不建 Peer、不应答 offer，房主的快速通道抢不进来
     awaitRole = !asPlayer;
@@ -355,6 +726,7 @@ const Net = (function () {
     lastAs = null;
     peerSid = null;
     pendingData = [];
+    closeAllMesh();
     startMqttSig(roomId, 'watch');
   }
 
@@ -376,6 +748,19 @@ const Net = (function () {
   }
 
   function send(obj) {
+    // 多人房音频帧：优先走各成员的 mesh 点对点通道（低延迟、不烧 broker）；
+    // 只要还有成员没打通（或在场表没收齐）就同时走总线广播兜底（收端按帧序号去重）
+    if (multiMode && obj instanceof Uint8Array) {
+      let sent = false;
+      const sids = Object.keys(meshConns);
+      for (let i = 0; i < sids.length; i++) {
+        const mc = meshConns[sids[i]];
+        if (mc && mc.open) { try { mc.send(obj); sent = true; } catch (e) {} }
+      }
+      if (sent && fullMesh()) return true;
+      if (busReady()) return busSend(obj, false) || sent;
+      return sent;
+    }
     if (conn && conn.open) {
       if (conn._relay) return conn.send(obj);   // 中继/观战：走总线，天然广播给观战者
       if (obj && obj.t) tr('send ' + obj.t);    // 直连控制消息入 trace（心跳/二进制帧不记）
@@ -398,14 +783,21 @@ const Net = (function () {
     dead = true;
     beaconWanted = false;
     awaitRole = false;
+    multiMode = false;
     stopMqttSig();
     clearP2pTimer();
     clearHb();
     pendingData = [];
+    closeAllMesh();
+    for (const k in peers) delete peers[k];
+    for (const k in pids) delete pids[k];
+    for (const k in pidToSid) delete pidToSid[k];
+    for (const k in meshTry) delete meshTry[k];
     const c = conn;
     conn = null;
     settled = false;
     peerSid = null;
+    dcSid = null;
     manualClose();
     try { if (c) c.close(); } catch (e) {}
     try { if (peer) peer.destroy(); } catch (e) {}
@@ -497,6 +889,31 @@ const Net = (function () {
   // 由上层（房主）维护：对局进行中 → 缺位时敲门者要先选身份
   function setInGame(b) { inGame = !!b; }
 
+  // 多人房开关（由语音层按 vc-pres 人数调用）：
+  // 开 → 主通道降回总线（控制消息全员广播）+ 按需建立两两 mesh 直连（音频帧低延迟通路）
+  // 关 → 回到两人房：关掉全部 mesh 通道，房主重新发 offer，直连按原有流程升级回来
+  function setMulti(on) {
+    on = !!on;
+    if (on === multiMode) return;
+    multiMode = on;
+    tr('multi=' + (on ? 1 : 0));
+    if (on) {
+      if (settled && conn && !conn._relay && busReady()) {
+        const old = conn;
+        conn = makeRelayWrap();
+        emit('relay');
+        try { old.close(); } catch (e) {}
+        peerGone = false;
+        startHb();
+      }
+      sendHb();      // 顺带触发一轮 mesh 心跳
+      meshTryAll();  // 在场表里已知的成员立即开拨（6s 节流兜底重试）
+    } else {
+      closeAllMesh();   // 回两人房：mesh 通道全部关闭，走原有两人直连升级流程
+      if (autoRole === 'host' && settled && mqttSig && mqttSig.ensureOffer) mqttSig.ensureOffer();
+    }
+  }
+
   // 房里是否已有存活的对战客方（第三方敲门要被引导去观战）。
   // 直连看数据通道；中继不能看 conn.open（host 一敲门就 settled，open 只是自家总线
   // 在线），要看「已收到过对方心跳且没超时判死」——没客方时心跳压根不会出现。
@@ -533,7 +950,8 @@ const Net = (function () {
     // 4s 重建一次形成 conn-close 循环（P2P 卡死不升级的根因）
     const mkOid = function () { return Math.random().toString(36).slice(2, 8); };
     const publishOffer = function () {
-      // 中继模式下也继续发布：供背景打洞的 offer/answer 交换用
+      // 中继模式下也继续发布：供背景打洞的 offer/answer 交换用（多人房除外：全员锁中继）
+      if (multiMode) return;
       if (st.offer && !st.done && (!settled || (conn && conn._relay))) pub({ k: 'o', sd: st.offer, sid: st.sid, oid: st.lastOid });
     };
     // 观战：收到房里任何人的消息即确认房间存在 → 入房
@@ -586,6 +1004,7 @@ const Net = (function () {
         // （对方早已收不到周期 offer），要重新生成 offer、放开应答闸，让对方接回
         st.ensureOffer = function () {
           if (st.done || dead) { tr('ensure-skip done'); return; }
+          if (multiMode) { tr('ensure-skip multi'); return; }
           if (!st.mq || !st.mq._opened) { tr('ensure-skip nobus'); return; }
           if (hostHealthy()) { tr('ensure-skip healthy'); return; }
           if (!settled && (st.offer || st.ensuring)) { tr('ensure-skip inflight'); return; }
@@ -648,6 +1067,7 @@ const Net = (function () {
         const sl = payload[1];
         let sid = '';
         for (let i = 0; i < sl; i++) sid += String.fromCharCode(payload[2 + i]);
+        notePeer(sid);                              // 帧即人证：收帧即知该成员在场
         if (sid === st.sid) { dOwnN++; return; }    // broker 回给发布者本人的回声
         const fromPeerF = !peerSid || sid === peerSid;
         if (fromPeerF) lastHb = Date.now();         // 收到对方音频帧 = 对方活着
@@ -660,19 +1080,24 @@ const Net = (function () {
         const frame = payload.subarray(2 + sl);
         if (frame.length < 9 || frame[0] !== 0xbe) { badN++; return; }
         dlvN++;
-        emit('frame', frame);
+        emit('frame', frame, sid);
         return;
       }
       let m;
       try { m = JSON.parse(payload); } catch (e) { badN++; return; }
+      if (m && m.sid) notePeer(m.sid, m.pid);   // 信令/心跳/控制任一消息都学习在场 + peerjs id
       if (t === dataTopic) {
         dAllN++;
         // 消息中继通道：心跳 + 对局消息（先滤掉自己发出去的回声，否则 lastHb 永远新鲜、
         // 自己的 undo-ok/restart-ok 会被自己再执行一遍）
         if (m && m.k === 'hb') tr(m.sid === st.sid ? 'hb-own' : 'hb-r');
         if (m && m.sid === st.sid) { dOwnN++; return; }
-        // 只认对局对方的心跳 sid 来判活：观战者不发心跳，其消息不能顶替对方在线
-        if (m && m.k === 'hb') peerSid = m.sid;
+        if (m && m.k === 'hbr') { if (m.t) rttSample(m.t); return; }
+        if (m && m.k === 'hb') {
+          peerSid = m.sid;
+          // 带时间戳的心跳 → 立即回声（中继 RTT 探针；多房全员回，采样者按 t 认领）
+          if (m.t) { try { mq.publish(dataTopic, JSON.stringify({ k: 'hbr', sid: st.sid, t: m.t, pid: (peer && peer.id) || undefined })); } catch (e) {} }
+        }
         const fromPeer = !peerSid || (m && m.sid === peerSid);
         if (fromPeer) lastHb = Date.now();
         // 对方掉线被判死后，收到对方消息 = 对方已回来：复活自己的心跳（否则对方等不到
@@ -716,11 +1141,13 @@ const Net = (function () {
         }
         return;
       }
+      if (m.k === 'mo' || m.k === 'ma') { onMeshSdp(m); return; }   // 多人 mesh 的 SDP 交换（to 寻址）
       if (m.k === 'j') {
         // 客方敲门 = 总线已就位：房主立刻先中继连上（不等打洞），并回 'hi' 让客方也连上
         if (role === 'host') {
-          // 房里已有存活的对战客方 → 回 'full' 让第三方转去观战（老客方带 resume 落到下面）
-          if (guestPresent() && !m.resume) {
+          // 房里已有存活的对战客方 → 回 'full' 让第三方转去观战（老客方带 resume 落到下面）。
+          // openRoom（语音房）不设两人上限：多人房靠 vc-pres 组织，敲门一律放行
+          if (!openRoom && guestPresent() && !m.resume) {
             tr('knock-full');
             pub({ k: 'full', sid: st.sid });
             return;
@@ -793,6 +1220,8 @@ const Net = (function () {
             });
         }
       } else if (role === 'guest' && m.k === 'o') {
+        // 多人房不接 offer（全员锁中继，只有两人房才打洞升级）
+        if (multiMode) { tr('offer-skip multi'); return; }
         // 先中继连上（'hi' 丢失时的兜底），打洞照常在背景走
         if (!settled) relayConnect('guest');
         // 直连健康 → 不再理会 offer；同一份 offer 只应答一次；
@@ -888,11 +1317,11 @@ const Net = (function () {
     });
   }
 
-  function attachManual(dc, role) {
+  function mkManualWrap(dc, pc, role) {
     dc.binaryType = 'arraybuffer';   // 二进制音频帧以 ArrayBuffer 落地（默认 Blob 异步不可用）
-    const wrap = {
+    return {
       peer: 'manual-' + role,
-      _pc: mpc,
+      _pc: pc,
       get open() { return dc.readyState === 'open'; },
       send: function (o) {
         if (dc.readyState !== 'open') return;
@@ -910,6 +1339,10 @@ const Net = (function () {
         }
       }
     };
+  }
+
+  function attachManual(dc, role) {
+    const wrap = mkManualWrap(dc, mpc, role);
     setupConn(wrap, role);
     if (dc.readyState === 'open') setTimeout(function () { fireConnected(wrap, role); }, 0);
   }
@@ -988,6 +1421,10 @@ const Net = (function () {
     signalingPending: signalingPending,
     resume: resume,
     setInGame: setInGame,
+    // 多人房/语音房钩子 + 本端总线 sid（vc-pres/加密信封都靠它标身份）
+    mySid: function () { return mqttSig ? mqttSig.sid : null; },
+    setMulti: setMulti,
+    setOpenRoom: function (b) { openRoom = !!b; },
     // broker 选路：上层按房间号哈希从 PRIMARY_GROUPS 推导确定性顺序（两端一致）
     brokerList: function () { return BROKERS.slice(); },
     brokerPrimaryGroups: function () {
@@ -1006,6 +1443,10 @@ const Net = (function () {
         open: !!(conn && conn.open),
         peerGone: peerGone,
         bus: busReady(),
+        rtt: rttEma ? Math.round(rttEma) : null,
+        multi: multiMode,
+        dc: dcSid,
+        psid: peerSid,
         // 诊断：分层计数（MQTT 收包 / net 交付 / 当前 broker / 残包缓冲）
         mqrx: (mqttSig && mqttSig.mq) ? (mqttSig.mq.rxN | 0) : -1,
         mqtx: (mqttSig && mqttSig.mq) ? (mqttSig.mq.txN | 0) : -1,
@@ -1013,7 +1454,11 @@ const Net = (function () {
         mqu: (mqttSig && mqttSig.mq && mqttSig.mq._pend) ? mqttSig.mq._pend.length : 0,
         mqtry: (mqttSig && mqttSig.mq) ? ((mqttSig.mq.tryN | 0) + '/' + (mqttSig.mq.failN | 0) + '/' + (mqttSig.mq._idx || 0) + '/' + (mqttSig.mq._opened ? 1 : 0) + '/' + (mqttSig.mq._tryTimer ? 1 : 0) + '/' + (mqttSig.mq._closed ? 1 : 0)) : '',
         da: dAllN, own: dOwnN, sig: sigN, bad: badN,
-        dlv: dlvN
+        dlv: dlvN,
+        // 多人 mesh：已打通的点对点通道数 / 在场表成员数（不含自己）/ 信令计数
+        mesh: openMeshCount(),
+        pn: Object.keys(peers).length,
+        mx: mx
       };
     },
     _trace: _trace

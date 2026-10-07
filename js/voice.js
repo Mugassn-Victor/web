@@ -18,6 +18,8 @@
   const PREBUF_MAX = 0.4;     // 断流补偿封顶：坏链路也最多 +400ms
   const REBUF_STEP = 0.05;    // 每次断流把缓冲抬高的步长（不再固定 +150ms）
   const DTX_TH = 0.012;       // 静音门限（NS/AGC 后底噪典型 <0.01，语音 RMS ~0.1+）
+  const SPK_TH = 0.02;        // 「正在说话」判定门限（收端帧峰值/本端 RMS，高于底噪）
+  const SPK_HOLD = 600;       // 说话高亮保持窗口（ms，覆盖 500ms UI 轮询的采样间隔）
 
   /* ---------- 状态 ---------- */
   const S = {
@@ -29,12 +31,23 @@
     peerMuted: false,
     call: 'idle',      // idle | dialing | ringing | in-call
     callStart: 0,
-    micOn: true
+    micOn: true,
+    rtt: null,         // 实测链路延迟 ms（Net.debugState().rtt 快照，未测得为 null）
+    mesh: 0,           // 多人房已打通的两两 P2P 通道数（Net.debugState().mesh）
+    pn: 0              // 在场表里的其他成员数（Net.debugState().pn）
   };
   const stats = { sent: 0, recv: 0, dropped: 0, rebased: 0, peak: 0, codec: '', e2e: 0, dtxMs: 0 };
   S.stats = stats;
   let lastReqT = 0;   // vc-req 去重窗口（发送端重发的同一次呼叫）
+  let dialSeq = 0, callCid = 0;   // 当前呼叫 id：拨号自增赋值、响铃取对端 req 的 cid；
+  // vc-ans/busy/end 只受理当前呼叫的（上一通的重发/迟到消息跨不了窗，防串线）
+  let roster = {};     // 房内成员 sid → {nick, st, mute, last}（vc-pres 周期维护）
+  let spkEnd = {};     // sid → 最近一次「在说话」的时间戳（收端帧峰值 + 本端 RMS）
+  let multiMode = false;   // 房间 ≥3 人（Net.setMulti 已锁中继）
+  S.nick = '';
   window.__vc = S;
+  // 语音房不设两人上限：敲门一律放行（多人房由 vc-pres 组织，见 roster/sweepRoster）
+  try { Net.setOpenRoom(true); } catch (e) {}
 
   /* ---------- 小工具 ---------- */
   let toastTO = null;
@@ -50,6 +63,9 @@
   // 加密仅限 vc-mute：建立/挂断关键信令（vc-req/ans/end）在轮换窗口里必然短暂无钥，
   // 包进去会把呼叫流程打死（实测回归）；音频正文本就单独 E2E（vc-k/vc-kreq 永远明文）
   function sendCtl(m) {
+    if (!m.sid) {                       // 统一带上本端 sid：收端靠它归属消息（vc-end 挂断级联等）
+      try { const s = Net.mySid && Net.mySid(); if (s) m.sid = s; } catch (e) {}
+    }
     const doSend = audioKey && m.t === 'vc-mute';
     [0, 150, 400].forEach(function (delay) {
       setTimeout(function () {
@@ -92,9 +108,7 @@
     if (ac.state === 'suspended') { try { await ac.resume(); } catch (e) {} }
     if (!playGain) {
       playGain = ac.createGain();
-      playGain.connect(ac.destination);
-    } else {
-      try { playGain.connect(ac.destination); } catch (e) {}
+      playGain.connect(ac.destination);   // 只在创建时连接一次（重复 connect 是回音排查项之一）
     }
     return ac;
   }
@@ -118,6 +132,11 @@
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
+    // 诊断：浏览器实际生效的回声消除参数（回音问题排查依据，读 track 设置而非请求值）
+    try {
+      const tr_ = micStream.getAudioTracks()[0].getSettings();
+      Net._trace.push('mic aec=' + tr_.echoCancellation + ' ns=' + tr_.noiseSuppression + ' agc=' + tr_.autoGainControl);
+    } catch (e) {}
     if (!workletReady) throw new Error('采集模块未就绪');
     capSrc = ac.createMediaStreamSource(micStream);
     capNode = new AudioWorkletNode(ac, 'cap-proc');
@@ -149,9 +168,11 @@
     if (!S.micOn) { pend = null; return; }
     let p16;
     try { p16 = resample(pcm, sr, RATE); } catch (e) { return; }
+    const rms = rmsOf(p16);
+    if (rms > SPK_TH) spkEnd[mySid() || 'me'] = Date.now();   // 本端说话高亮（静音时 mic disabled，天然不亮）
     // DTX：连续 5 块（250ms）低于门限 → 停发，语音回来立即复发。
     // 接收端不需改动：长静音期播放缓冲自然耗尽，下一帧按断流重建时间轴即可对齐
-    if (rmsOf(p16) > DTX_TH) {
+    if (rms > DTX_TH) {
       dtxOn = false; dtxRun = 0;
     } else if (!dtxOn && ++dtxRun >= 5) {
       dtxOn = true; dtxRun = 0; pend = null;   // 进入 DTX：丢弃半块，别把静音尾巴发出去
@@ -185,7 +206,8 @@
     brCur = want;
     try { enc.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1, bitrate: want }); } catch (e) {}
   }
-  let dec = null, decBroken = false;
+  let decoders = {};         // sid → AudioDecoder（多人房每路独立解码，输出按 sid 归属播放时间轴）
+  let decBroken = false;
 
   function initEncoder() {
     if (enc) { stats.codec = 'opus'; return true; }   // 同页第二通起复用实例：startCall 清过
@@ -273,14 +295,14 @@
     });
   }
 
-  function ensureDecoder() {
-    if (dec) return true;
+  function ensureDecoder(sid) {
+    if (decoders[sid]) return decoders[sid];
     if (decBroken || typeof AudioDecoder === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
       if (!stats.codecErr) stats.codecErr = 'no-decoder ' + (typeof AudioDecoder) + '/' + (typeof EncodedAudioChunk);
-      return false;
+      return null;
     }
     try {
-      dec = new AudioDecoder({
+      const d = new AudioDecoder({
         output: function (ad) {
           try {
             const f32 = new Float32Array(ad.numberOfFrames * ad.numberOfChannels);
@@ -292,23 +314,24 @@
                 f32[i] = s / ad.numberOfChannels;
               }
             }
-            trackPeak(f32);
-            scheduleBlk(f32, ad.sampleRate);            // 解码输出速率以 AudioData 为准
+            trackPeak(f32, sid);
+            scheduleBlk(f32, ad.sampleRate, sid);       // 解码输出速率以 AudioData 为准
           } catch (e) { stats.dropped++; stats.codecErr = 'out:' + (e && e.message || e); }
           try { ad.close(); } catch (e) {}
         },
         error: function (e) {
-          decBroken = true; try { dec.close(); } catch (e2) {}
-          dec = null;
+          decBroken = true; try { d.close(); } catch (e2) {}
+          delete decoders[sid];
           stats.codecErr = 'decerr:' + (e && e.message || e);
         }
       });
-      dec.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
-      return true;
+      d.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
+      decoders[sid] = d;
+      return d;
     } catch (e) {
-      dec = null; decBroken = true;
+      decBroken = true;
       stats.codecErr = 'cfg:' + (e && e.message || e);
-      return false;
+      return null;
     }
   }
 
@@ -334,70 +357,83 @@
     return c;
   }
 
-  /* ---------- 播放 ---------- */
-  let nextT = 0, lastN = -1, playedAny = false;
+  /* ---------- 播放（按 sid 分路：直连帧=对端总线 sid，中继帧=信封 sid，多房每路独立时间轴） ---------- */
+  let playStates = {};   // sid → {nextT, lastN, playedAny, prebuf, lastUnderrunT, lastShrinkT}
   let staleUntil = 0;   // 回前台后清 OS 积压 backlog 的时间窗（过期帧只计数不播）
-  let prebuf = PREBUF_INIT, lastUnderrunT = 0, lastShrinkT = 0;
 
-  function trackPeak(f32) {
+  function psid(sid) {
+    let p = playStates[sid];
+    if (!p) p = playStates[sid] = { nextT: 0, lastN: -1, playedAny: false, prebuf: PREBUF_INIT, lastUnderrunT: 0, lastShrinkT: 0 };
+    return p;
+  }
+
+  function trackPeak(f32, sid) {
     let pk = 0;
     for (let i = 0; i < f32.length; i += 8) { const a = f32[i] < 0 ? -f32[i] : f32[i]; if (a > pk) pk = a; }
     if (pk > stats.peak) stats.peak = pk;
+    if (sid && pk > SPK_TH) spkEnd[sid] = Date.now();   // 收端「对方正在说话」高亮
   }
 
   function onAudio(msg) {
     if (S.call === 'idle' || !ac || !playGain) { stats.dropped++; return; }
+    const key = msg.sid || 'p2p';
+    S.frameSid = key;
+    const p = psid(key);
     const n = msg.n | 0;
-    if (lastN >= 0 && n <= lastN) { stats.dropped++; return; }   // 乱序/重复
-    if (Date.now() < staleUntil) { lastN = n; stats.dropped++; return; }   // 回前台 flush 的过期帧
+    if (p.lastN >= 0 && n <= p.lastN) { stats.dropped++; return; }   // 乱序/重复
+    if (Date.now() < staleUntil) { p.lastN = n; stats.dropped++; return; }   // 回前台 flush 的过期帧
     const blkSamples = Math.round(RATE * (msg.d === 100 ? 100 : BLOCK_MS) / 1000);
-    if (lastN >= 0 && n > lastN + 1) {
-      const gap = Math.min(n - lastN - 1, 30);
-      scheduleBlk(new Float32Array(gap * blkSamples));        // 丢帧补静音（同步：只依赖 n/d）
+    if (p.lastN >= 0 && n > p.lastN + 1) {
+      const gap = Math.min(n - p.lastN - 1, 30);
+      scheduleBlk(new Float32Array(gap * blkSamples), undefined, key);   // 丢帧补静音（同步：只依赖 n/d）
     }
-    lastN = n;
+    p.lastN = n;
     stats.recv++;
     const b = msg.b, enc = !!msg.enc;        // b = Uint8Array（二进制帧直通）
     queuePlay(async function () {                            // 解密→出声按到达顺序串行
       let f32;
       if (enc) {
         const pt = await openBlob(b, true);                  // 无钥/解不开 → vc-kreq 自愈，弃帧
-        if (!pt) return;
+        if (!pt) { stats.decFail = (stats.decFail | 0) + 1; return; }
         f32 = u8ToF32(pt);
       } else {
         f32 = u8ToF32(b);
       }
-      trackPeak(f32);
-      scheduleBlk(f32);
+      trackPeak(f32, key);
+      scheduleBlk(f32, undefined, key);
     });
   }
 
   function onAudioOpus(msg) {
     if (S.call === 'idle' || !ac || !playGain) { stats.dropped++; return; }
+    const key = msg.sid || 'p2p';
+    S.frameSid = key;
+    const p = psid(key);
     const n = msg.n | 0;
-    if (lastN >= 0 && n <= lastN) { stats.dropped++; return; }
-    if (Date.now() < staleUntil) { lastN = n; stats.dropped++; return; }   // 回前台 flush 的过期帧
+    if (p.lastN >= 0 && n <= p.lastN) { stats.dropped++; return; }
+    if (Date.now() < staleUntil) { p.lastN = n; stats.dropped++; return; }   // 回前台 flush 的过期帧
     const dms = Math.max(20, msg.d | 0);
-    if (lastN >= 0 && n > lastN + 1) {
-      const gap = Math.min(n - lastN - 1, 30);
-      scheduleBlk(new Float32Array(Math.round(RATE * dms / 1000) * gap));   // 丢消息补静音
+    if (p.lastN >= 0 && n > p.lastN + 1) {
+      const gap = Math.min(n - p.lastN - 1, 30);
+      scheduleBlk(new Float32Array(Math.round(RATE * dms / 1000) * gap), undefined, key);   // 丢消息补静音
     }
-    lastN = n;
+    p.lastN = n;
     stats.recv++;
     const b = msg.b, enc = !!msg.enc;        // b = Uint8Array（二进制帧直通）
     queuePlay(async function () {
-      if (!ensureDecoder()) return;
+      const dd = ensureDecoder(key);
+      if (!dd) return;
       let arr;
       if (enc) {
         const pt = await openBlob(b, true);                  // 无钥/解不开 → vc-kreq 自愈，弃帧
-        if (!pt) return;
+        if (!pt) { stats.decFail = (stats.decFail | 0) + 1; return; }
         arr = unpackChunks(pt);
       } else {
         arr = unpackChunks(b);
       }
       for (let i = 0; i < arr.length; i++) {
         try {
-          dec.decode(new EncodedAudioChunk({
+          dd.decode(new EncodedAudioChunk({
             type: 'key', data: arr[i], timestamp: n * 1000000 + i * 20000
           }));
         } catch (e) { stats.dropped++; }
@@ -405,8 +441,10 @@
     });
   }
 
-  function scheduleBlk(f32, srcRate) {
+  function scheduleBlk(f32, srcRate, sid) {
     try {
+      const key = sid || 'p2p';
+      const p = psid(key);
       const pcm = resample(f32, srcRate || RATE, ac.sampleRate);
       const buf = ac.createBuffer(1, Math.max(1, pcm.length), ac.sampleRate);
       buf.getChannelData(0).set(pcm);
@@ -416,32 +454,31 @@
       const now = ac.currentTime;
       const wall = Date.now();
       // 健康播放 1s 后每秒收缩 15ms：150ms 起步 → 约 6s 后稳到 60ms
-      if (playedAny && wall - lastUnderrunT > 1000 && wall - lastShrinkT > 1000 &&
-          prebuf > (S.relay ? PREBUF_MIN : PREBUF_MIN_D)) {
-        prebuf = Math.max(S.relay ? PREBUF_MIN : PREBUF_MIN_D, prebuf - 0.015);
-        lastShrinkT = wall;
+      if (p.playedAny && wall - p.lastUnderrunT > 1000 && wall - p.lastShrinkT > 1000 &&
+          p.prebuf > (S.relay ? PREBUF_MIN : PREBUF_MIN_D)) {
+        p.prebuf = Math.max(S.relay ? PREBUF_MIN : PREBUF_MIN_D, p.prebuf - 0.015);
+        p.lastShrinkT = wall;
       }
-      if (nextT <= now) {                    // 首帧或断流（缓冲空了）→ 重建时间轴
-        if (playedAny) {
-          prebuf = Math.min(PREBUF_MAX, prebuf + REBUF_STEP);  // 断流：抬高缓冲防连环卡顿
+      if (p.nextT <= now) {                  // 首帧或断流（缓冲空了）→ 重建时间轴
+        if (p.playedAny) {
+          p.prebuf = Math.min(PREBUF_MAX, p.prebuf + REBUF_STEP);   // 断流：抬高缓冲防连环卡顿
           stats.rebased++;
         } else {
           // 新通话起步：中继抖动大从 150ms 起步，直连无损直接用 30ms 稳态下限（省掉 6s 收缩）
-          prebuf = S.relay ? PREBUF_INIT : PREBUF_MIN_D;
+          p.prebuf = S.relay ? PREBUF_INIT : PREBUF_MIN_D;
         }
-        nextT = now + prebuf;
-        playedAny = true;
-        lastUnderrunT = wall;
-        lastShrinkT = wall;
+        p.nextT = now + p.prebuf;
+        p.playedAny = true;
+        p.lastUnderrunT = wall;
+        p.lastShrinkT = wall;
       }
-      src.start(nextT);
-      nextT += buf.duration;
+      src.start(p.nextT);
+      p.nextT += buf.duration;
     } catch (e) { stats.dropped++; }
   }
 
   function resetPlayout() {
-    nextT = 0; lastN = -1; playedAny = false;
-    prebuf = PREBUF_INIT; lastUnderrunT = 0; lastShrinkT = 0;
+    playStates = {};
   }
 
   /* ---------- 铃声（WebAudio 振荡器，无音频素材依赖） ---------- */
@@ -540,16 +577,22 @@
   let myGen = 0, peerGen = -1;             // 密钥代次：每通轮换 myGen++，等对方同代才成钥
   let audioKey = null, keyP = null, deriveP = null;
   let lastKreqT = 0;                       // vc-kreq 节流（音频帧反复解不开时最多 1 次/秒）
+  let pks = {};                            // sid → {pk, g}：vc-k 携带发送方 sid（多人房按人分钥）
+  let derivePs = {};                       // sid → 派生 promise 缓存（仅用于 vc-rk 包装）
+  let roomKey = null, roomKeyRaw = null;   // 多人房房间密钥：音频统一用它（对密钥只做分发包装）
+  let rkSent = {};                         // sid → 已分发的 roomKeyRaw（防重发风暴）
   const subtleOk = !!(window.crypto && crypto.subtle && window.TextEncoder);
 
   function initCrypto() {
     ecdhPair = null; myPk = null; pkSent = false; peerPk = null;
     myGen = 0; peerGen = -1;
     audioKey = null; keyP = null; deriveP = null;
+    pks = {}; derivePs = {};
+    roomKey = null; roomKeyRaw = null; rkSent = {};
     if (subtleOk) ensureKeyPair();
   }
   function ensureKeyPair(renew) {
-    if (renew) { keyP = null; ecdhPair = null; myPk = null; }   // 轮换：作废旧密钥对
+    if (renew) { keyP = null; ecdhPair = null; myPk = null; derivePs = {}; }   // 轮换：作废旧密钥对与按人派生缓存
     if (keyP) return keyP;
     if (!subtleOk) { keyP = Promise.resolve(null); return keyP; }
     keyP = crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveKey'])
@@ -605,17 +648,63 @@
     }
     return audioKey;                       // 超时 → 明文降级，通话中 vc-kreq 到达后可升回
   }
-  async function encBlob(u8) {
+  async function encK(key, u8) {
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, audioKey, u8));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, u8));
     const out = new Uint8Array(12 + ct.length);
     out.set(iv, 0); out.set(ct, 12);
     return out;
   }
-  async function decBlob(u8) {
+  async function decK(key, u8) {
     if (u8.length < 12 + 16) throw new Error('enc-short');
     return new Uint8Array(await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: u8.subarray(0, 12) }, audioKey, u8.subarray(12)));
+      { name: 'AES-GCM', iv: u8.subarray(0, 12) }, key, u8.subarray(12)));
+  }
+  async function encBlob(u8) { return encK(audioKey, u8); }
+  async function decBlob(u8) { return decK(audioKey, u8); }
+
+  /* ---- 多人房房间密钥（vc-rk）：房主随机生成 32B，用与每人各自的 ECDH 对密钥
+     包装后广播分发（只有 to 指定者能拆开）；全员 audioKey 换成房间密钥后，
+     一帧加密所有人可解，broker/其他成员只见密文。两人房不用（保持每通轮换的对密钥）。 */
+  async function useRoomKey() {
+    if (!roomKey) return false;
+    audioKey = roomKey;
+    return true;
+  }
+  function derivePairFor(sid) {           // 与 sid 指定成员的对密钥（只用于包装/拆 vc-rk）
+    const ent = pks[sid];
+    if (!subtleOk || !ent || !ent.pk || !ecdhPair) return Promise.resolve(null);
+    if (derivePs[sid] && derivePs[sid].pk === ent.pk) return derivePs[sid].p;
+    const p = crypto.subtle.importKey('raw', b64ToU8(ent.pk),
+        { name: 'ECDH', namedCurve: 'P-256' }, false, [])
+      .then(function (pub) {
+        return crypto.subtle.deriveKey({ name: 'ECDH', public: pub }, ecdhPair.privateKey,
+          { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      })
+      .catch(function () { return null; });
+    derivePs[sid] = { pk: ent.pk, p: p };
+    return p;
+  }
+  function maybeGenRoomKey() {           // 仅房主、仅多人房
+    if (!subtleOk || roomKeyRaw || S.mode !== 'host') return;
+    const raw = crypto.getRandomValues(new Uint8Array(32));
+    roomKeyRaw = u8ToB64(raw);
+    crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+      .then(function (k) { roomKey = k; audioKey = k; stats.e2e = 1; })
+      .catch(function () { roomKeyRaw = null; });
+    for (const s in roster) maybeSendRoomKey(s);
+  }
+  async function maybeSendRoomKey(sid, force) {
+    if (!subtleOk || !roomKeyRaw || !sid || S.mode !== 'host') return;
+    if (force) delete rkSent[sid];
+    if (rkSent[sid] === roomKeyRaw) return;
+    const pair = await derivePairFor(sid);
+    if (!pair) return;
+    try {
+      const ct = await encK(pair, b64ToU8(roomKeyRaw));
+      Net.send({ t: 'vc-rk', to: sid, from: mySid(), b: u8ToB64(ct) });
+      rkSent[sid] = roomKeyRaw;
+    } catch (e) {}
   }
   // 多个 20ms opus 包打成一包：每包 2 字节长度前缀 + 数据，整包一次加解密
   function packChunks(chunks) {
@@ -692,7 +781,9 @@
       myGen++;
       await ensureKeyPair(true);
       pkSent = false; sendPk();         // 新公钥三连发出（vc-k 永不明文加密，见 sendCtl）
-      await awaitAudioKey(1500);        // 等 ECDH 派生就绪（通常 ms 级；超时→明文降级）
+      // 多人房优先用房间密钥（已由房主 vc-rk 分发，通常即时就绪）；
+      // 否则等 ECDH 对密钥（通常 ms 级；超时→明文降级）
+      if (!(await useRoomKey())) await awaitAudioKey(1500);
       stats.e2e = audioKey ? 1 : 0;     // 诊断：本通是否端到端加密（0=明文降级）
       await startMic();
       ringStop();                       // 双保险：封杀 await 间隙里才落地的晚到铃声
@@ -747,8 +838,9 @@
         if (Date.now() - lastReqT < 1000) break;   // 三次重发里的重复呼叫
         lastReqT = Date.now();
         if (S.call === 'ringing') break;
-        if (S.call !== 'idle') { sendCtl({ t: 'vc-busy' }); return; }
+        if (S.call !== 'idle') { sendCtl({ t: 'vc-busy', cid: d.cid | 0 }); return; }
         S.call = 'ringing';
+        callCid = d.cid | 0;
         refresh();
         // 竞态：铃声要等 AudioContext/worklet 就绪才起，慢手机上用户可能已经接听
         // （btnAnswer 的 ringStop 跑在前面停了个空）——不加状态闸，晚到的铃声会
@@ -760,31 +852,79 @@
         }).catch(function () {});
         break;
       case 'vc-busy':
+        if (d.cid && d.cid !== callCid) break;   // 上一通的迟到占线回执
         if (S.call === 'dialing') { ringStop(); stopMic(); S.call = 'idle'; toast('对方占线'); refresh(); }
         break;
       case 'vc-ans':
         try { Net._trace.push((Date.now() % 100000000) + ' vc-ans-recv'); } catch (e) {}
+        if (d.cid && d.cid !== callCid) break;   // 上一通的迟到应答
         if (S.call === 'dialing') startCall();
         break;
       case 'vc-end':
+        if (d.cid && d.cid !== callCid) break;   // 陈旧挂断（上一通的重发）：不受理
         if (S.call === 'dialing') { ringStop(); stopMic(); S.call = 'idle'; toast('对方拒绝了通话'); refresh(); }
         else if (S.call === 'ringing') { ringStop(); stopMic(); S.call = 'idle'; refresh(); }
-        else if (S.call === 'in-call') endCall('对方挂断了通话');
+        else if (S.call === 'in-call') {
+          // 多人房：挂断只下线自己。房里还有别人在通话 → 不整体收线；
+          // 两人房（或已无人）→ 与原先一致，直接收线
+          if (d.sid && callOthers(d.sid) > 0) {
+            try { Net._trace.push((Date.now() % 100000000) + ' vc-end keep-others'); } catch (e) {}
+            toast('有人挂断了通话');
+          } else {
+            endCall('对方挂断了通话');
+          }
+        }
         break;
       case 'vc-mute':
         S.peerMuted = !!d.on;
         refresh();
         break;
+      case 'vc-pres':                     // 成员在线通告：昵称 + 通话状态（多人房的花名册）
+        if (!d.sid || d.sid === mySid()) break;
+        roster[d.sid] = {
+          nick: String(d.nick || '成员').slice(0, 12),
+          st: d.st || 'idle',
+          mute: !!d.mute,
+          last: Date.now()
+        };
+        if (S.mode === 'host' && multiMode) maybeSendRoomKey(d.sid);   // 新成员补发房间钥匙
+        sweepRoster();
+        break;
       case 'vc-k':
         if (!d.pk) break;
+        if (d.sid) pks[d.sid] = { pk: d.pk, g: (d.g | 0) };
         if (d.pk !== peerPk || (d.g | 0) !== peerGen) {   // 首把/对端轮换 → 作废旧派生重来
           peerPk = d.pk; peerGen = (d.g | 0);
-          audioKey = null; deriveP = null;
+          deriveP = null;
+          // 多人房音频钥 = 房间密钥，不能被对密钥交换打翻（对密钥只用于 vc-rk 包装）
+          if (!roomKey) audioKey = null;
         }
-        ensureKeyPair().then(function () { sendPk(); return deriveAudioKey(); }, function () {});
+        ensureKeyPair().then(function () {
+          sendPk();
+          if (S.mode === 'host' && multiMode && d.sid) maybeSendRoomKey(d.sid);
+          return deriveAudioKey();
+        }, function () {});
         break;
       case 'vc-kreq':                       // 对端音频解不开 → 重发当前公钥（不轮换只重发）
         pkSent = false; sendPk();
+        if (S.mode === 'host' && multiMode && d.sid) maybeSendRoomKey(d.sid, true);   // 房间钥匙一并补发
+        break;
+      case 'vc-rk':                         // 房主分发的多人房房间密钥（用与我的对密钥包装）
+        (async function () {
+          if (!subtleOk || !d.b || !d.from) return;
+          if (d.to && d.to !== mySid()) return;           // 不是发给我的（广播里别人那份）
+          try {
+            const pair = await derivePairFor(d.from);
+            if (!pair) return;
+            const raw = await decK(pair, b64ToU8(d.b));
+            if (raw.length !== 32) return;
+            const k = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+            roomKeyRaw = u8ToB64(raw);
+            roomKey = k; audioKey = k;                     // 全员统一切到房间密钥
+            stats.e2e = 1;
+            try { Net._trace.push((Date.now() % 100000000) + ' vc-rk ok'); } catch (e) {}
+          } catch (e) {}
+        })();
         break;
       case 'vc-x':                          // 加密控制消息（sendCtl 有钥时整体 GCM）
         (async function () {
@@ -822,34 +962,128 @@
     brokerCanon.forEach(function (u) { if (order.indexOf(u) < 0) order.push(u); });
     try { Net.setBrokerOrder(order); } catch (e) {}
   }
+
+  /* ---------- 昵称 / 花名册 / 在线通告（vc-pres） ---------- */
+  function mySid() { try { return Net.mySid && Net.mySid(); } catch (e) { return null; } }
+  function nickVal() { return String(($('nickInput').value || '')).trim().slice(0, 12); }
+  function clearRoster() {
+    roster = {};
+    multiMode = false;
+    spkEnd = {};
+  }
+  function sendPres() {
+    if (!S.mode) return;
+    const sid = mySid();
+    if (!sid) return;
+    try {
+      Net.send({ t: 'vc-pres', sid: sid, nick: S.nick, st: S.call, mute: !S.micOn });
+    } catch (e) {}
+  }
+  let presIv = null;
+  function startPres() {
+    if (presIv) return;
+    presIv = setInterval(function () { sendPres(); sweepRoster(); }, 2500);
+    sendPres();
+  }
+  function stopPres() { if (presIv) { clearInterval(presIv); presIv = null; } }
+  // 花名册清扫：成员 9s 无通告视为离开（2.5s 周期 ×3 次未见）；
+  // 除自己外 ≥2 人 → 多人房（Net.setMulti 锁中继），回到 ≤1 人 → 恢复两人打洞
+  function sweepRoster() {
+    const now = Date.now();
+    let n = 0;
+    for (const k in roster) {
+      if (now - roster[k].last > 9000) delete roster[k];
+      else n++;
+    }
+    const want = n >= 2;
+    if (want !== multiMode) {
+      multiMode = want;
+      try { Net.setMulti(want); } catch (e) {}
+      try { Net._trace.push((Date.now() % 100000000) + ' vc-multi=' + (want ? 1 : 0) + ' n=' + n); } catch (e) {}
+      if (want && S.mode === 'host') maybeGenRoomKey();
+      sendPres();                       // 切换传输后立刻同步（对端靠它尽快看到全员名单）
+    }
+    renderRoster();
+  }
+  // 除自己/指定 sid 外，花名册里还在通话中的人数（vc-end 挂断级联判定）
+  function callOthers(excludeSid) {
+    let n = 0;
+    for (const k in roster) {
+      if (k === excludeSid) continue;
+      if (roster[k].st === 'in-call') n++;
+    }
+    return n;
+  }
+  function escHtml(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  function renderRoster() {
+    const box = $('rosterCard'), list = $('rosterList');
+    if (!box || !list) return;
+    if (!S.mode) { box.classList.add('hidden'); return; }
+    box.classList.remove('hidden');
+    const now = Date.now();
+    const me = mySid() || 'me';
+    const rows = [{ sid: me, nick: S.nick || '我', self: true, st: S.call }];
+    for (const k in roster) rows.push({ sid: k, nick: roster[k].nick, self: false, st: roster[k].st });
+    S.rosterN = rows.length;
+    S.spkIds = Object.keys(spkEnd).join(',');
+    S.selfId = me;
+    S.ka = audioKey ? (roomKey && audioKey === roomKey ? 2 : 1) : 0;   // 0无钥 1对密钥 2房间密钥
+    S.kr = roomKey ? 1 : 0;
+    let html = '';
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const spk = now - (spkEnd[r.sid] || 0) < SPK_HOLD;
+      html += '<li data-sid="' + escHtml(r.sid) + '"' + (spk ? ' class="spk"' : '') + '>' +
+        '<span class="dot"></span><span class="rnick">' + escHtml(r.nick) + (r.self ? '（我）' : '') + '</span>' +
+        '<span class="rst">' + (r.st === 'in-call' ? '通话中' : (r.st === 'ringing' ? '响铃中' : '')) + '</span></li>';
+    }
+    list.innerHTML = html;
+  }
+
   function onCreate() {
     if (S.mode) return;
+    if (!nickVal()) { setStatus('请先输入昵称', true); return; }
     const code = String(Math.floor(100000 + Math.random() * 900000));
+    S.nick = nickVal();
+    try { localStorage.setItem('xqn', S.nick); } catch (e) {}
     S.mode = 'host';
     S.roomId = code;
     $('roomCode').textContent = code;
     $('hostPanel').classList.remove('hidden');
     setStatus('正在建立连接…');
+    clearRoster();
     initCrypto();
     applyBrokerOrder(code);
     Net.create(code);
+    startPres();
     refresh();
   }
   function onJoin() {
     if (S.mode) return;
     const v = ($('roomInput').value || '').trim();
     if (!/^\d{6}$/.test(v)) { setStatus('请输入 6 位数字房间号', true); return; }
+    if (!nickVal()) { setStatus('请先输入昵称', true); return; }
+    S.nick = nickVal();
+    try { localStorage.setItem('xqn', S.nick); } catch (e) {}
     S.mode = 'guest';
     S.roomId = v;
     setStatus('正在连接房间 ' + v + '…');
+    clearRoster();
     initCrypto();
     applyBrokerOrder(v);
     Net.join(v, true);
+    startPres();
     refresh();
   }
   function resetLobby() {
     try { Net.destroy(); } catch (e) {}
     stopMic();
+    stopPres();
+    clearRoster();
     S.mode = ''; S.roomId = ''; S.linked = false;
     $('hostPanel').classList.add('hidden');
     refresh();
@@ -890,10 +1124,17 @@
     $('callPeer').textContent = S.peerMuted ? '通话中 · 对方已静音' : '通话中';
     updateNetHint();
     updateLinkTag();
+    renderRoster();
+    sendPres();                 // 状态变化（接通/挂断/静音/入房）即刻同步给房内成员
   }
   function updateNetHint() {
     if (S.disconnected) { $('netHint').textContent = '连接中断，等待恢复…'; return; }
-    let h = S.relay ? '服务器中继（延迟较高）' : 'P2P 直连';
+    let h;
+    if (!S.relay) h = 'P2P 直连';                             // 两人房：唯一通道就是直连
+    else if (S.mesh > 0 && S.mesh >= S.pn) h = 'P2P 直连 · 多人';  // 混合网状：全员两两打通
+    else if (S.mesh > 0) h = 'P2P×' + S.mesh + ' · 中继兜底';      // 部分对打通，其余走总线
+    else h = '服务器中继';
+    if (S.rtt) h += ' · 延迟 ' + S.rtt + 'ms';   // 实测往返时延（hb 时间戳回声，见 net.js rttEma）
     if (S.peerMuted) h += ' · 对方已静音';
     $('netHint').textContent = h;
   }
@@ -905,14 +1146,18 @@
     else { tag.textContent = '已连接·直连'; tag.className = 'tag on'; }
   }
 
-  // 500ms 轮询：链路徽章 + 通话统计
+  // 500ms 轮询：链路徽章 + 实测延迟 + 通话统计 + 花名册（说话高亮靠它刷新）
   setInterval(function () {
     try {
       const d = Net.debugState();
       S.relay = !!(d.settled && d.relay);
+      S.rtt = d.rtt || null;
+      S.mesh = d.mesh | 0;
+      S.pn = d.pn | 0;
     } catch (e) {}
     updateNetHint();
     updateLinkTag();
+    renderRoster();
     if (S.call === 'in-call') {
       const tot = stats.recv + stats.dropped;      // 质量徽章：收侧丢包率的就近代用指标
       const loss = tot > 0 ? stats.dropped / tot : 0;
@@ -960,14 +1205,14 @@
     if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { return; } }
     onMessage(d);
   });
-  Net.on('frame', function (u8) {          // 二进制音频帧分发（见 binFrame 布局）
+  Net.on('frame', function (u8, sid) {       // 二进制音频帧分发（见 binFrame 布局）；sid=发送方归属
     if (!u8 || u8.length < 9 || u8[0] !== 0xbe) return;
     const type = u8[1], enc = !!(u8[2] & 1);
     const d = (u8[3] << 8) | u8[4];
     const n = ((u8[5] << 24) | (u8[6] << 16) | (u8[7] << 8) | u8[8]) >>> 0;
     const b = u8.subarray(9);
-    if (type === 1) onAudio({ n: n, d: d, enc: enc, b: b });
-    else if (type === 2) onAudioOpus({ n: n, d: d, enc: enc, b: b });
+    if (type === 1) onAudio({ n: n, d: d, enc: enc, b: b, sid: sid });
+    else if (type === 2) onAudioOpus({ n: n, d: d, enc: enc, b: b, sid: sid });
   });
   window.addEventListener('beforeunload', function () { try { Net.destroy(); } catch (e) {} });
   // 移动端锁屏/切后台：AudioContext 被挂起（采集、播放、铃声全停），OS 还会攒下一堆
@@ -979,13 +1224,14 @@
       try { const p = ac.resume(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
     }
     if (S.call === 'in-call') {
-      nextT = 0;
+      for (const k in playStates) playStates[k].nextT = 0;   // 各路播放时间轴作废（下一帧按断流重建）
       staleUntil = Date.now() + 250;
       requestWake();                     // wakeLock 在隐藏时被系统释放，回前台重新申请
     }
   });
 
   /* ---------- 按钮 ---------- */
+  try { $('nickInput').value = localStorage.getItem('xqn') || ''; } catch (e) {}   // 昵称记忆
   $('btnCreate').onclick = onCreate;
   $('btnJoin').onclick = onJoin;
   $('roomInput').addEventListener('keydown', function (e) {
@@ -1000,8 +1246,9 @@
   $('btnCall').onclick = function () {
     if (!S.linked || S.call !== 'idle') return;
     S.call = 'dialing';                // 同步落地：vc-ans 秒回/用户秒取消都不会被状态闸挡住
+    callCid = ++dialSeq;               // 本次呼叫 id（对端响铃时记下，回执/挂断按 id 对表）
     refresh();
-    sendCtl({ t: 'vc-req' });
+    sendCtl({ t: 'vc-req', cid: callCid });
     ensureAudio().then(function () {
       if (S.call === 'dialing') ringStart('dial');   // 等待期间可能已接通/取消
       startMic().catch(function () {});              // 拨号即请求权限，接听瞬间已就绪
@@ -1011,26 +1258,26 @@
     ringStop();
     stopMic();
     S.call = 'idle';
-    sendCtl({ t: 'vc-end' });
+    sendCtl({ t: 'vc-end', cid: callCid });
     refresh();
   };
   $('btnAnswer').onclick = function () {
     try { Net._trace.push((Date.now() % 100000000) + ' btnAnswer state=' + S.call); } catch (e) {}
     if (S.call !== 'ringing') return;
     ringStop();
-    sendCtl({ t: 'vc-ans' });
+    sendCtl({ t: 'vc-ans', cid: callCid });
     startCall();
   };
   $('btnReject').onclick = function () {
     if (S.call !== 'ringing') return;
     ringStop();
     stopMic();
-    sendCtl({ t: 'vc-end' });
+    sendCtl({ t: 'vc-end', cid: callCid });
     S.call = 'idle';
     refresh();
   };
   $('btnHangup').onclick = function () {
-    sendCtl({ t: 'vc-end' });
+    sendCtl({ t: 'vc-end', cid: callCid });
     endCall('通话已结束');
   };
   $('btnMute').onclick = function () {
