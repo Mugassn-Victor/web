@@ -439,7 +439,7 @@ const Net = (function () {
 
   /* ===== 备用信令：公共 MQTT broker（WebSocket 直连，无需注册/自建服务器） ===== */
 
-  const BROKERS = [
+  let BROKERS = [
     'wss://broker.emqx.io:8084/mqtt',
     'wss://broker.hivemq.com:8884/mqtt',
     'wss://test.mosquitto.org:8081/mqtt',
@@ -476,6 +476,8 @@ const Net = (function () {
     if (conn && conn._relay) return !!(peerSid && (Date.now() - lastHb) < HB_MAX);
     return !!(conn && conn.open);
   }
+
+  let dlvN = 0, dAllN = 0, dOwnN = 0, sigN = 0, badN = 0;   // 诊断计数
 
   function startMqttSig(room, role, as) {
     stopMqttSig();
@@ -602,12 +604,13 @@ const Net = (function () {
     mq.onmessage = function (t, payload) {
       if (st.done || dead) { if (t === dataTopic) tr('dt-drop ' + (dead ? 'dead' : 'done')); return; }
       let m;
-      try { m = JSON.parse(payload); } catch (e) { return; }
+      try { m = JSON.parse(payload); } catch (e) { badN++; return; }
       if (t === dataTopic) {
+        dAllN++;
         // 消息中继通道：心跳 + 对局消息（先滤掉自己发出去的回声，否则 lastHb 永远新鲜、
         // 自己的 undo-ok/restart-ok 会被自己再执行一遍）
         if (m && m.k === 'hb') tr(m.sid === st.sid ? 'hb-own' : 'hb-r');
-        if (m && m.sid === st.sid) return;
+        if (m && m.sid === st.sid) { dOwnN++; return; }
         // 只认对局对方的心跳 sid 来判活：观战者不发心跳，其消息不能顶替对方在线
         if (m && m.k === 'hb') peerSid = m.sid;
         const fromPeer = !peerSid || (m && m.sid === peerSid);
@@ -637,10 +640,11 @@ const Net = (function () {
         // （自己走中继/直连已死/已判死时，正本可能根本没送到 → 镜像成了唯一副本）
         if (m && m.mir && autoRole !== 'watch' &&
             conn && !conn._relay && conn.open && !peerGone) return;
-        if (m && m.k === 'm' && m.d !== undefined) { tr('recv ' + (m.d && m.d.t)); deliver(m.d); }
+        if (m && m.k === 'm' && m.d !== undefined) { dlvN++; tr('recv ' + (m.d && m.d.t)); deliver(m.d); }
         return;
       }
       if (t !== topic) return;
+      sigN++;
       if (!m || m.sid === st.sid) return;
       if (role === 'watch') {
         watchFound();
@@ -912,6 +916,13 @@ const Net = (function () {
     signalingPending: signalingPending,
     resume: resume,
     setInGame: setInGame,
+    // broker 选路：上层启动时实测各端点回环 RTT 后重排（下一次连接生效）
+    brokerList: function () { return BROKERS.slice(); },
+    setBrokerOrder: function (arr) {
+      if (!arr || !arr.length) return;
+      const keep = BROKERS.filter(function (u) { return arr.indexOf(u) < 0; });
+      BROKERS = arr.concat(keep);
+    },
     // 测试钩子：E2E 读取传输状态（直连/中继/总线/判死）
     debugState: function () {
       return {
@@ -919,7 +930,15 @@ const Net = (function () {
         relay: !!(conn && conn._relay),
         open: !!(conn && conn.open),
         peerGone: peerGone,
-        bus: busReady()
+        bus: busReady(),
+        // 诊断：分层计数（MQTT 收包 / net 交付 / 当前 broker / 残包缓冲）
+        mqrx: (mqttSig && mqttSig.mq) ? (mqttSig.mq.rxN | 0) : -1,
+        mqtx: (mqttSig && mqttSig.mq) ? (mqttSig.mq.txN | 0) : -1,
+        mqurl: (mqttSig && mqttSig.mq) ? (mqttSig.mq._pendingUrl || '') : '',
+        mqu: (mqttSig && mqttSig.mq && mqttSig.mq._pend) ? mqttSig.mq._pend.length : 0,
+        mqtry: (mqttSig && mqttSig.mq) ? ((mqttSig.mq.tryN | 0) + '/' + (mqttSig.mq.failN | 0) + '/' + (mqttSig.mq._idx || 0) + '/' + (mqttSig.mq._opened ? 1 : 0) + '/' + (mqttSig.mq._tryTimer ? 1 : 0) + '/' + (mqttSig.mq._closed ? 1 : 0)) : '',
+        da: dAllN, own: dOwnN, sig: sigN, bad: badN,
+        dlv: dlvN
       };
     },
     _trace: _trace

@@ -3,13 +3,15 @@
    传输复用 net.js 三层兜底（broker 中继 → WebRTC 打洞 → TURN）：
    - 直连/TURN：音频帧走 DataChannel（JSON，与棋步同管道）
    - broker 中继：音频帧走同一 Net.send → 自动经总线转发（P2P 打不通也能聊）
-   音频格式：16kHz 单声道 PCM16，每 50ms 一块，base64 后发出。 */
+   音频格式：16kHz 单声道，优先 Opus（WebCodecs，20ms/帧，~20 帧组一条网络消息），
+   浏览器不支持时回退 PCM16 base64。接收端两种消息都认。 */
 (function () {
   const $ = function (id) { return document.getElementById(id); };
 
   const RATE = 16000;
   const BLOCK_MS = 50;
   const BLOCK_SAMPLES = RATE * BLOCK_MS / 1000;   // 800
+  const OPUS_FRAME = 320;   // Opus 一帧 20ms @16kHz
   const PREBUF_INIT = 0.15;   // 初始抖动缓冲（秒）
   const PREBUF_MIN = 0.06;    // 稳态下限：健康链路稳态只留 60ms
   const PREBUF_MAX = 0.4;     // 断流补偿封顶：坏链路也最多 +400ms
@@ -27,7 +29,7 @@
     callStart: 0,
     micOn: true
   };
-  const stats = { sent: 0, recv: 0, dropped: 0, rebased: 0, peak: 0 };
+  const stats = { sent: 0, recv: 0, dropped: 0, rebased: 0, peak: 0, codec: '' };
   S.stats = stats;
   let lastReqT = 0;   // vc-req 去重窗口（发送端重发的同一次呼叫）
   window.__vc = S;
@@ -129,13 +131,132 @@
     if (S.relay) {
       // broker 中继（QoS0 公共节点）扛不住 20 帧/秒的速率，实测丢帧率会翻倍：
       // 攒两块 50ms 合成一块 100ms 发（帧率降到 10/秒，与改版前同速率）
-      if (pend) { sendFrame(concatF32(pend, p16), BLOCK_MS * 2); pend = null; }
+      if (pend) { emitBlock(concatF32(pend, p16), BLOCK_MS * 2); pend = null; }
       else pend = p16;
     } else {
-      if (pend) { sendFrame(pend, BLOCK_MS); pend = null; }   // 中继→直连切换：把攒着的先发掉
-      sendFrame(p16, BLOCK_MS);
+      if (pend) { emitBlock(pend, BLOCK_MS); pend = null; }   // 中继→直连切换：把攒着的先发掉
+      emitBlock(p16, BLOCK_MS);
     }
   }
+
+  /* ---------- Opus 编解码（WebCodecs；不支持则整体回退 PCM） ---------- */
+  let enc = null, encBroken = false, encRem = null, encTs = 0;
+  let sendQ = [];            // 已编码待发送的 20ms 包
+  let flushIv = null, lastFlushT = 0;
+  let dec = null, decBroken = false;
+
+  function initEncoder() {
+    if (enc) return true;
+    if (encBroken || typeof AudioEncoder === 'undefined' || typeof AudioData === 'undefined') return false;
+    try {
+      enc = new AudioEncoder({
+        output: function (chunk) {
+          try {
+            const u8 = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(u8);
+            sendQ.push(u8);
+          } catch (e) {}
+        },
+        error: function (e) { encBroken = true; enc = null; stats.codec = 'pcm'; stats.codecErr = 'encerr:' + (e && e.message || e); }
+      });
+      enc.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1, bitrate: 24000 });
+      stats.codec = 'opus';
+      return true;
+    } catch (e) {
+      enc = null; encBroken = true; stats.codec = 'pcm';
+      stats.codecErr = 'encfg:' + (e && e.message || e);
+      return false;
+    }
+  }
+
+  function emitBlock(f32, ms) {
+    if (!initEncoder()) {                 // 回退 PCM（老浏览器/编码器异常）
+      if (!stats.codec) stats.codec = 'pcm';
+      sendFrame(f32, ms);
+      return;
+    }
+    let buf = encRem && encRem.length ? concatF32(encRem, f32) : f32;
+    const nFrames = Math.floor(buf.length / OPUS_FRAME);
+    if (!nFrames) { encRem = buf; return; }
+    encRem = nFrames * OPUS_FRAME < buf.length ? buf.slice(nFrames * OPUS_FRAME) : null;
+    for (let i = 0; i < nFrames; i++) {
+      try {
+        enc.encode(new AudioData({
+          format: 'f32-planar', sampleRate: RATE, numberOfFrames: OPUS_FRAME,
+          numberOfChannels: 1, timestamp: encTs,
+          data: buf.subarray(i * OPUS_FRAME, (i + 1) * OPUS_FRAME)
+        }));
+        encTs += 20000;
+      } catch (e) {
+        encBroken = true;
+        try { enc.close(); } catch (e2) {}
+        enc = null; stats.codec = 'pcm';
+        sendFrame(buf.slice(i * OPUS_FRAME), ms);   // 当前帧起转回 PCM
+        return;
+      }
+    }
+  }
+
+  function startFlush() {
+    stopFlush();
+    lastFlushT = 0;
+    flushIv = setInterval(flushOpus, 50);
+  }
+  function stopFlush() {
+    if (flushIv) { clearInterval(flushIv); flushIv = null; }
+    sendQ = []; encRem = null;
+  }
+  function flushOpus() {
+    if (!sendQ.length) return;
+    const now = Date.now();
+    if (S.relay && now - lastFlushT < 95) return;   // 中继：攒到 ~100ms 一发
+    lastFlushT = now;
+    const chunks = sendQ.splice(0);
+    const b64s = [];
+    for (let i = 0; i < chunks.length; i++) b64s.push(u8ToB64(chunks[i]));
+    if (Net.send({ t: 'vc-o', n: seq++, d: b64s.length * 20, b: b64s })) stats.sent++;
+    else stats.dropped++;
+  }
+
+  function ensureDecoder() {
+    if (dec) return true;
+    if (decBroken || typeof AudioDecoder === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
+      if (!stats.codecErr) stats.codecErr = 'no-decoder ' + (typeof AudioDecoder) + '/' + (typeof EncodedAudioChunk);
+      return false;
+    }
+    try {
+      dec = new AudioDecoder({
+        output: function (ad) {
+          try {
+            const f32 = new Float32Array(ad.numberOfFrames * ad.numberOfChannels);
+            ad.copyTo(f32, { format: 'f32', planeIndex: 0 });
+            if (ad.numberOfChannels > 1) {              // 混成单声道
+              for (let i = 0; i < ad.numberOfFrames; i++) {
+                let s = 0;
+                for (let c = 0; c < ad.numberOfChannels; c++) s += f32[i * ad.numberOfChannels + c];
+                f32[i] = s / ad.numberOfChannels;
+              }
+            }
+            trackPeak(f32);
+            scheduleBlk(f32, ad.sampleRate);            // 解码输出速率以 AudioData 为准
+          } catch (e) { stats.dropped++; stats.codecErr = 'out:' + (e && e.message || e); }
+          try { ad.close(); } catch (e) {}
+        },
+        error: function (e) {
+          decBroken = true; try { dec.close(); } catch (e2) {}
+          dec = null;
+          stats.codecErr = 'decerr:' + (e && e.message || e);
+        }
+      });
+      dec.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
+      return true;
+    } catch (e) {
+      dec = null; decBroken = true;
+      stats.codecErr = 'cfg:' + (e && e.message || e);
+      return false;
+    }
+  }
+
   function sendFrame(p16, ms) {
     const b64 = floatToB64(p16);
     if (Net.send({ t: 'vc-a', n: seq++, b: b64, d: ms })) stats.sent++;
@@ -151,6 +272,12 @@
   let nextT = 0, lastN = -1, playedAny = false;
   let prebuf = PREBUF_INIT, lastUnderrunT = 0, lastShrinkT = 0;
 
+  function trackPeak(f32) {
+    let pk = 0;
+    for (let i = 0; i < f32.length; i += 8) { const a = f32[i] < 0 ? -f32[i] : f32[i]; if (a > pk) pk = a; }
+    if (pk > stats.peak) stats.peak = pk;
+  }
+
   function onAudio(msg) {
     if (S.call === 'idle' || !ac || !playGain) { stats.dropped++; return; }
     const n = msg.n | 0;
@@ -164,15 +291,35 @@
     }
     lastN = n;
     stats.recv++;
-    let pk = 0;
-    for (let i = 0; i < f32.length; i += 8) { const a = f32[i] < 0 ? -f32[i] : f32[i]; if (a > pk) pk = a; }
-    if (pk > stats.peak) stats.peak = pk;
+    trackPeak(f32);
     scheduleBlk(f32);
   }
 
-  function scheduleBlk(f32) {
+  function onAudioOpus(msg) {
+    if (S.call === 'idle' || !ac || !playGain) { stats.dropped++; return; }
+    const n = msg.n | 0;
+    if (lastN >= 0 && n <= lastN) { stats.dropped++; return; }
+    const dms = Math.max(20, msg.d | 0);
+    if (lastN >= 0 && n > lastN + 1) {
+      const gap = Math.min(n - lastN - 1, 30);
+      scheduleBlk(new Float32Array(Math.round(RATE * dms / 1000) * gap));   // 丢消息补静音
+    }
+    lastN = n;
+    stats.recv++;
+    if (!ensureDecoder()) { stats.dropped++; return; }
+    const arr = Array.isArray(msg.b) ? msg.b : [msg.b];
+    for (let i = 0; i < arr.length; i++) {
+      try {
+        dec.decode(new EncodedAudioChunk({
+          type: 'key', data: b64ToU8(arr[i]), timestamp: n * 1000000 + i * 20000
+        }));
+      } catch (e) { stats.dropped++; }
+    }
+  }
+
+  function scheduleBlk(f32, srcRate) {
     try {
-      const pcm = resample(f32, RATE, ac.sampleRate);
+      const pcm = resample(f32, srcRate || RATE, ac.sampleRate);
       const buf = ac.createBuffer(1, Math.max(1, pcm.length), ac.sampleRate);
       buf.getChannelData(0).set(pcm);
       const src = ac.createBufferSource();
@@ -191,7 +338,8 @@
           prebuf = Math.min(PREBUF_MAX, prebuf + REBUF_STEP);  // 断流：抬高缓冲防连环卡顿
           stats.rebased++;
         } else {
-          prebuf = PREBUF_INIT;              // 新通话从初始缓冲起步
+          // 新通话起步：中继抖动大从 150ms 起步，直连无损直接用稳态下限（省掉 6s 收缩）
+          prebuf = S.relay ? PREBUF_INIT : PREBUF_MIN;
         }
         nextT = now + prebuf;
         playedAny = true;
@@ -275,6 +423,17 @@
     for (let i = 0; i < out.length; i++) out[i] = dv.getInt16(i << 1, true) / 0x8000;
     return out;
   }
+  function u8ToB64(u8) {
+    let s = '';
+    for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+  function b64ToU8(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+  }
 
   /* ---------- 通话状态机 ---------- */
   async function startCall() {
@@ -284,6 +443,8 @@
     seq = 0;
     pend = null;
     stats.sent = 0; stats.recv = 0; stats.dropped = 0; stats.rebased = 0; stats.peak = 0;
+    stats.codec = '';
+    delete stats.codecErr;
     resetPlayout();
     S.call = 'in-call';                 // 状态在第一个 await 之前落地：杜绝双开采集
     S.callStart = Date.now();
@@ -292,6 +453,7 @@
     try {
       await ensureAudio();
       await startMic();
+      startFlush();                        // 编码结果按网络节奏发出（直连 50ms / 中继 100ms）
     } catch (e) {
       const msg = '无法开启麦克风：' + (e && e.message || e);
       S.lastErr = String(msg);
@@ -306,6 +468,7 @@
 
   function endCall(reason) {
     stopMic();
+    stopFlush();
     ringStop();
     stopTimer();
     if (playGain) { try { playGain.disconnect(); } catch (e) {} playGain = null; }
@@ -362,10 +525,31 @@
       case 'vc-a':
         onAudio(d);
         break;
+      case 'vc-o':
+        onAudioOpus(d);
+        break;
     }
   }
 
   /* ---------- 大厅 ---------- */
+  // 两端必须落在同一个 broker 上（信令房间不跨 broker）。选路只由房间号推导：
+  // 两个实测满速无丢包的 broker（mosquitto/hivemq）按房间号哈希定先后，两端
+  // 同房间必得同一顺序；emqx 有 ~10msg/s 限速（实测 11msg/s 丢 8%），恒排末尾
+  // 仅作连通性兜底。页面加载时的规范顺序（未被重排过）缓存下来供选路用。
+  let brokerCanon = null;
+  try { brokerCanon = Net.brokerList().slice(); } catch (e) {}
+  function applyBrokerOrder(room) {
+    if (!brokerCanon || brokerCanon.length < 2) return;
+    const mosq = brokerCanon.filter(function (u) { return u.indexOf('mosquitto') >= 0; });
+    const hum = brokerCanon.filter(function (u) { return u.indexOf('hivemq') >= 0; });
+    const rest = brokerCanon.filter(function (u) {
+      return mosq.indexOf(u) < 0 && hum.indexOf(u) < 0;
+    });
+    let h = 5381;
+    for (let i = 0; i < room.length; i++) h = ((h << 5) + h + room.charCodeAt(i)) >>> 0;
+    const order = (h % 2 === 0) ? mosq.concat(hum) : hum.concat(mosq);
+    try { Net.setBrokerOrder(order.concat(rest)); } catch (e) {}
+  }
   function onCreate() {
     if (S.mode) return;
     const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -374,6 +558,7 @@
     $('roomCode').textContent = code;
     $('hostPanel').classList.remove('hidden');
     setStatus('正在建立连接…');
+    applyBrokerOrder(code);
     Net.create(code);
     refresh();
   }
@@ -384,6 +569,7 @@
     S.mode = 'guest';
     S.roomId = v;
     setStatus('正在连接房间 ' + v + '…');
+    applyBrokerOrder(v);
     Net.join(v, true);
     refresh();
   }
